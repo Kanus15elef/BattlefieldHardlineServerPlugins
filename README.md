@@ -1,4 +1,4 @@
-So those we have 2 plugins here that have been written by me and with the support of ai ( gemini and copilot )  heres an explanations on what each plugins do and how it is working:
+So we have 2 plugins here that have been written by me and with the support of ai ( gemini and copilot )  heres an explanations on what each plugins do and how it is working:
 
 CSquadAutoBalancer.cs : this plugin is a balancing plugin for battlefield hardline which containing few cool features to improve player experience on the server either if you are solo or playing with friends to keep the player engage in fair matches while making sure the teams are always balanced to the maximum while keeping every match different from last match so how the plugin work you may ask before that i will explain the features for better understanding the core of the plugin:
 
@@ -71,4 +71,4 @@ Doucef_moy ,
 TacobellsJr,
 North
 
-** This plugin isnt allowed to be sold in any shape or form  
+** Those plugins are not allowed to be sold in any shape or form  
