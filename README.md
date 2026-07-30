@@ -65,10 +65,10 @@ bonus : a player can type !nextmap and it will say in chat whats the next map in
 
 so thats for the plugins the plugins can still have bugs you can report them to me through github so i will make changes to it and patch them if you support my work and want to donate you can ask in the github and we will find a way ( i have no idea how to do it but yea ) special thanks to the play testers and bug testers :
 
-Kanus15elefV2
-Kanus15elefV3
-Doucef_moy 
-TacobellsJr
+Kanus15elefV2,
+Kanus15elefV3,
+Doucef_moy ,
+TacobellsJr,
 North
 
 ** This plugin isnt allowed to be sold in any shape or form  
