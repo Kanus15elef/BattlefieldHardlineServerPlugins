@@ -10,6 +10,12 @@ namespace PRoConEvents
 {
     public class CVotingSystem : PRoConPluginAPI, IPRoConPluginInterface
     {
+        public enum enumYesNo
+        {
+            Yes,
+            No
+        }
+
         #region Plugin Variables & States
 
         private enum VotingPhase
@@ -25,6 +31,9 @@ namespace PRoConEvents
         private readonly object syncLock = new object();
         private Random rnd = new Random();
 
+        // Plugin Console Setting
+        private enumYesNo proconLiveUpdate = enumYesNo.Yes;
+
         // Timers
         private Timer roundStartDelayTimer;
         private Timer votingPeriodicTimer;
@@ -34,10 +43,12 @@ namespace PRoConEvents
         private int currentPlayerCount = 0;
         private int minimumPlayersToVote = 4;
         private bool isWaitingForPlayers = false;
+        private DateTime lastThresholdLogTime = DateTime.MinValue;
 
         // Loop & Round Tracker
         private string previousLevelName = string.Empty;
         private int currentMapLoadSequenceCount = 0;
+        private int currentRoundsPlayed = 0;
 
         // Voting Data
         private List<string> activeMapPool = new List<string>();
@@ -57,8 +68,19 @@ namespace PRoConEvents
         private int mapVotingIntervalCount = 0;
         private int gamemodeVotingIntervalCount = 0;
         
-        // Heist Round Trackers
-        private bool isHeistRoundOne = false;
+        // Map Queue & Injection Flags
+        private bool isNextMapQueued = false;
+        
+        // Multi-Round Memory Tray & Match Tracking
+        private bool isWaitingForRoundTwoInjection = false;
+        private string storedRoundTwoMap = string.Empty;
+        private string storedRoundTwoMode = string.Empty;
+        private bool hasVotedThisMatch = false;
+
+        private string currentActiveMapInternalName = string.Empty;
+        private string currentActiveGamemodeInternalName = string.Empty;
+        private string currentActiveMapFriendlyName = string.Empty;
+        private string currentActiveGamemodeFriendlyName = string.Empty;
 
         // Master List of Maps
         private readonly List<string> allPossibleMaps = new List<string>
@@ -113,6 +135,11 @@ namespace PRoConEvents
         private int votingStatusUpdateIntervalSeconds = 30;           
         private int delayBetweenMapAndModeVotingSeconds = 10;         
 
+        // Admin / Developer settings
+        private string adminNamesCsv = string.Empty;
+        private HashSet<string> adminSet = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private string developerName = "kanus15elef";
+
         #endregion
 
         #region Standard PRoCon Plugin API
@@ -120,21 +147,24 @@ namespace PRoConEvents
         public CVotingSystem() { }
 
         public string GetPluginName() { return "CVotingSystem"; }
-        public string GetPluginVersion() { return "1.1.26"; }
+        public string GetPluginVersion() { return "2.0.1"; }
         public string GetPluginAuthor() { return "Yonatan (kanus15elef)"; }
         public string GetPluginWebsite() { return "localhost"; }
-        public string GetPluginDescription() { return "Advanced Map & Gamemode Voting with Engine Loop Bypass & UI Sync."; }
+        public string GetPluginDescription() { return "Advanced Map & Gamemode Voting with safe MapList injection."; }
 
         public List<CPluginVariable> GetDisplayPluginVariables()
         {
             return new List<CPluginVariable>()
             {
+                new CPluginVariable("proconLiveUpdate", "enum.enumYesNo(Yes|No)", proconLiveUpdate.ToString()),
                 new CPluginVariable("minimumPlayersToVote", typeof(int), minimumPlayersToVote.ToString()),
                 new CPluginVariable("mapVotingStartDelaySeconds", typeof(int), mapVotingStartDelaySeconds.ToString()),
                 new CPluginVariable("mapVotingDurationSeconds", typeof(int), mapVotingDurationSeconds.ToString()),
                 new CPluginVariable("modeVotingDurationSeconds", typeof(int), modeVotingDurationSeconds.ToString()),
                 new CPluginVariable("votingStatusUpdateIntervalSeconds", typeof(int), votingStatusUpdateIntervalSeconds.ToString()),
-                new CPluginVariable("delayBetweenMapAndModeVotingSeconds", typeof(int), delayBetweenMapAndModeVotingSeconds.ToString())
+                new CPluginVariable("delayBetweenMapAndModeVotingSeconds", typeof(int), delayBetweenMapAndModeVotingSeconds.ToString()),
+                new CPluginVariable("adminNames", typeof(string), adminNamesCsv ?? string.Empty),
+                new CPluginVariable("developerName", typeof(string), developerName ?? string.Empty)
             };
         }
 
@@ -147,14 +177,39 @@ namespace PRoConEvents
         {
             try
             {
+                if (string.IsNullOrEmpty(strVariable)) return;
+                strValue = strValue ?? string.Empty;
+
                 switch (strVariable)
                 {
-                    case "minimumPlayersToVote": minimumPlayersToVote = Math.Max(1, int.Parse(strValue)); break;
-                    case "mapVotingStartDelaySeconds": mapVotingStartDelaySeconds = Math.Max(1, int.Parse(strValue)); break;
-                    case "mapVotingDurationSeconds": mapVotingDurationSeconds = Math.Max(1, int.Parse(strValue)); break;
-                    case "modeVotingDurationSeconds": modeVotingDurationSeconds = Math.Max(1, int.Parse(strValue)); break;
-                    case "votingStatusUpdateIntervalSeconds": votingStatusUpdateIntervalSeconds = Math.Max(1, int.Parse(strValue)); break;
-                    case "delayBetweenMapAndModeVotingSeconds": delayBetweenMapAndModeVotingSeconds = Math.Max(1, int.Parse(strValue)); break;
+                    case "proconLiveUpdate":
+                        try { proconLiveUpdate = (enumYesNo)Enum.Parse(typeof(enumYesNo), strValue, true); } catch { }
+                        break;
+                    case "minimumPlayersToVote":
+                        int minP; if (int.TryParse(strValue, out minP)) minimumPlayersToVote = Math.Max(1, minP);
+                        break;
+                    case "mapVotingStartDelaySeconds":
+                        int delay; if (int.TryParse(strValue, out delay)) mapVotingStartDelaySeconds = Math.Max(1, delay);
+                        break;
+                    case "mapVotingDurationSeconds":
+                        int mDur; if (int.TryParse(strValue, out mDur)) mapVotingDurationSeconds = Math.Max(1, mDur);
+                        break;
+                    case "modeVotingDurationSeconds":
+                        int modeDur; if (int.TryParse(strValue, out modeDur)) modeVotingDurationSeconds = Math.Max(1, modeDur);
+                        break;
+                    case "votingStatusUpdateIntervalSeconds":
+                        int vInt; if (int.TryParse(strValue, out vInt)) votingStatusUpdateIntervalSeconds = Math.Max(1, vInt);
+                        break;
+                    case "delayBetweenMapAndModeVotingSeconds":
+                        int transition; if (int.TryParse(strValue, out transition)) delayBetweenMapAndModeVotingSeconds = Math.Max(1, transition);
+                        break;
+                    case "adminNames":
+                        adminNamesCsv = strValue;
+                        UpdateAdminSet();
+                        break;
+                    case "developerName":
+                        developerName = strValue;
+                        break;
                 }
             }
             catch { }
@@ -177,13 +232,14 @@ namespace PRoConEvents
 
         public void OnPluginEnable()
         {
-            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v1.1.26 Enabled!");
-            ResetVotingState();
+            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v2.0.1 Enabled!");
+            ResetVotingState(true);
             currentPlayerCount = 0;
             isWaitingForPlayers = false;
-            isHeistRoundOne = false;
+            isNextMapQueued = false;
             previousLevelName = string.Empty;
             currentMapLoadSequenceCount = 0;
+            UpdateAdminSet();
             this.ExecuteCommand("procon.protected.send", "admin.listPlayers", "all");
         }
 
@@ -191,6 +247,42 @@ namespace PRoConEvents
         {
             this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n Disabled!");
             StopAllTimers();
+        }
+
+        private void LogLive(string message)
+        {
+            if (proconLiveUpdate == enumYesNo.Yes)
+            {
+                this.ExecuteCommand("procon.protected.pluginconsole.write", message);
+            }
+        }
+
+        #endregion
+
+        #region Admin helpers
+
+        private void UpdateAdminSet()
+        {
+            lock (syncLock)
+            {
+                adminSet.Clear();
+                if (!string.IsNullOrEmpty(adminNamesCsv))
+                {
+                    var parts = adminNamesCsv.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var p in parts)
+                    {
+                        var n = p.Trim();
+                        if (!string.IsNullOrEmpty(n)) adminSet.Add(n);
+                    }
+                }
+            }
+        }
+
+        private bool IsAuthorized(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            if (!string.IsNullOrEmpty(developerName) && name.Equals(developerName, StringComparison.OrdinalIgnoreCase)) return true;
+            lock (syncLock) { return adminSet.Contains(name); }
         }
 
         #endregion
@@ -202,13 +294,19 @@ namespace PRoConEvents
             lock (syncLock) 
             { 
                 currentPlayerCount++; 
+                LogLive($"[CVotingSystem] [Live]: Player Joined ({strSoldierName}). Total Current Players: {currentPlayerCount}");
                 CheckMinimumPlayers();
             }
         }
 
         public void OnPlayerLeft(CPlayerInfo playerInfo)
         {
-            lock (syncLock) { currentPlayerCount = Math.Max(0, currentPlayerCount - 1); }
+            lock (syncLock) 
+            { 
+                currentPlayerCount = Math.Max(0, currentPlayerCount - 1); 
+                string playerName = playerInfo != null ? playerInfo.SoldierName : "Unknown";
+                LogLive($"[CVotingSystem] [Live]: Player Left ({playerName}). Total Current Players: {currentPlayerCount}");
+            }
         }
 
         public void OnListPlayers(List<CPlayerInfo> players, CPlayerSubset subset)
@@ -216,17 +314,45 @@ namespace PRoConEvents
             lock (syncLock) 
             { 
                 currentPlayerCount = players.Count; 
+                LogLive($"[CVotingSystem] [Live]: Player List Updated. Total Current Players: {currentPlayerCount}");
                 CheckMinimumPlayers();
             }
         }
 
         private void CheckMinimumPlayers()
         {
-            if (isWaitingForPlayers && currentPlayerCount >= minimumPlayersToVote && currentPhase == VotingPhase.Idle)
+            lock (syncLock)
             {
-                isWaitingForPlayers = false;
-                this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Player threshold reached. Triggering voting countdown.");
-                TriggerRoundStartSequence();
+                bool thresholdMet = currentPlayerCount >= minimumPlayersToVote;
+
+                if (!isWaitingForPlayers && !thresholdMet && currentPhase == VotingPhase.Idle && !hasVotedThisMatch)
+                {
+                    isWaitingForPlayers = true;
+                    lastThresholdLogTime = DateTime.Now;
+                    LogLive($"[CVotingSystem] [Live]: Player count ({currentPlayerCount}) is below minimum requirement ({minimumPlayersToVote}). Entering waiting state until players join.");
+                }
+                else if (isWaitingForPlayers && thresholdMet && currentPhase == VotingPhase.Idle && roundStartDelayTimer == null && !hasVotedThisMatch)
+                {
+                    isWaitingForPlayers = false;
+                    LogLive($"[CVotingSystem] [Live]: Minimum player count requirement reached ({currentPlayerCount}/{minimumPlayersToVote}). Starting voting countdown immediately!");
+                    
+                    double delayMs = mapVotingStartDelaySeconds * 1000.0;
+                    if (delayMs <= 0) delayMs = 1000.0;
+
+                    roundStartDelayTimer = new Timer(delayMs);
+                    roundStartDelayTimer.Elapsed += StartMapVotingPhase;
+                    roundStartDelayTimer.AutoReset = false;
+                    roundStartDelayTimer.Start();
+                }
+
+                if (isWaitingForPlayers && currentPhase == VotingPhase.Idle)
+                {
+                    if ((DateTime.Now - lastThresholdLogTime).TotalSeconds >= 60)
+                    {
+                        LogLive($"[CVotingSystem] [Live]: Checking Threshold -> Current Players: {currentPlayerCount} | Min Required: {minimumPlayersToVote} | WaitingState: {isWaitingForPlayers} | Phase: {currentPhase} | TimerActive: {(roundStartDelayTimer != null)}");
+                        lastThresholdLogTime = DateTime.Now;
+                    }
+                }
             }
         }
 
@@ -234,20 +360,27 @@ namespace PRoConEvents
 
         #region Round & Timer Management
 
-        private bool IsHeist(string gamemode)
+        private bool IsHeistOrSquadHeist(string gamemode)
         {
             if (string.IsNullOrEmpty(gamemode)) return false;
             return gamemode.Equals("Heist0", StringComparison.OrdinalIgnoreCase) ||
-                   gamemode.Equals("Heist", StringComparison.OrdinalIgnoreCase);
+                   gamemode.Equals("Heist", StringComparison.OrdinalIgnoreCase) ||
+                   gamemode.Equals("SquadHeist0", StringComparison.OrdinalIgnoreCase) ||
+                   gamemode.Equals("Squad Heist", StringComparison.OrdinalIgnoreCase);
         }
 
         public void OnLevelLoaded(string mapFileName, string Gamemode, int roundsPlayed, int roundsTotal)
         {
             lock (syncLock)
             {
-                this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: Map loaded. Mode: {Gamemode}, RoundsPlayed: {roundsPlayed}");
+                currentActiveMapInternalName = mapFileName;
+                currentActiveGamemodeInternalName = Gamemode;
+                currentActiveMapFriendlyName = GetFriendlyMapName(mapFileName);
+                currentActiveGamemodeFriendlyName = GetFriendlyModeName(Gamemode);
+                currentRoundsPlayed = roundsPlayed;
 
-                // 1. Consecutive Load Loop Tracker
+                LogLive($"[CVotingSystem] [Live]: OnLevelLoaded -> Map: {currentActiveMapFriendlyName} ({mapFileName}), Mode: {currentActiveGamemodeFriendlyName} ({Gamemode}), Round: {roundsPlayed + 1} of {roundsTotal}");
+
                 if (string.Equals(previousLevelName, mapFileName, StringComparison.OrdinalIgnoreCase))
                 {
                     currentMapLoadSequenceCount++;
@@ -258,55 +391,60 @@ namespace PRoConEvents
                     currentMapLoadSequenceCount = 1;
                 }
 
-                this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: Map load sequence count for {mapFileName}: {currentMapLoadSequenceCount}");
-
-                // If the engine maliciously loops back and reloads the same map a second consecutive time, force the next map!
-                if (currentMapLoadSequenceCount >= 2)
+                int maxAllowedLoads = IsHeistOrSquadHeist(Gamemode) ? 2 : 1;
+                if (currentMapLoadSequenceCount > maxAllowedLoads)
                 {
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Detected infinite map reload bug loop. Forcing immediate map advancement.");
+                    LogLive($"[CVotingSystem] [Live]: Detected infinite map reload loop bug (Sequence: {currentMapLoadSequenceCount}). Forcing immediate map advancement.");
                     this.ExecuteCommand("procon.protected.send", "mapList.runNextMap");
                     return;
                 }
 
-                // Engine-safe Maplist Initialization: Clears the slate ONLY on fresh matches (roundsPlayed == 0)
-                try
-                {
-                    if (roundsPlayed == 0 && currentMapLoadSequenceCount == 1)
-                    {
-                        string safeMode = string.IsNullOrEmpty(Gamemode) ? "Heist0" : Gamemode;
-                        string defaultRounds = IsHeist(safeMode) || safeMode.Equals("SquadHeist0", StringComparison.OrdinalIgnoreCase) ? "2" : "1";
-                        
-                        this.ExecuteCommand("procon.protected.send", "mapList.clear");
-                        this.ExecuteCommand("procon.protected.send", "mapList.add", mapFileName, safeMode, defaultRounds, "0");
-                        this.ExecuteCommand("procon.protected.send", "mapList.save");
-                        this.ExecuteCommand("procon.protected.send", "mapList.list");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", "^1Error initializing maplist: " + ex.Message);
-                }
+                bool isRoundTwo = (roundsPlayed >= 1) || (IsHeistOrSquadHeist(Gamemode) && currentMapLoadSequenceCount == 2);
 
-                // Handle Round-specific behavior
-                if (roundsPlayed == 0)
+                if (isRoundTwo)
                 {
-                    isHeistRoundOne = IsHeist(Gamemode);
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Round 1 started. Triggering voting countdown.");
-                    TriggerRoundStartSequence();
-                }
-                else if (roundsPlayed == 1)
-                {
-                    isHeistRoundOne = false;
-                    
-                    if (currentPhase == VotingPhase.Idle)
+                    LogLive($"[CVotingSystem] [Live]: Round 2/2 detected on {currentActiveMapFriendlyName}.");
+
+                    if (isWaitingForRoundTwoInjection)
                     {
-                        this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Round 2 started and voting hasn't happened yet (fast rush). Triggering voting now.");
+                        LogLive($"[CVotingSystem] [Live]: Injecting stored memory tray map ({storedRoundTwoMap} [{storedRoundTwoMode}]) now!");
+                        
+                        winningMap = storedRoundTwoMap;
+                        winningGamemode = storedRoundTwoMode;
+                        ApplyNextMapMidRound();
+                        
+                        isWaitingForRoundTwoInjection = false;
+                        storedRoundTwoMap = string.Empty;
+                        storedRoundTwoMode = string.Empty;
+                    }
+
+                    if (currentPhase == VotingPhase.Idle && !hasVotedThisMatch)
+                    {
                         TriggerRoundStartSequence();
                     }
-                    else
+                }
+                else if (currentMapLoadSequenceCount == 1)
+                {
+                    LogLive("[CVotingSystem] [Live]: New match started (Round 0 / Round 1 of map). Resetting voting states.");
+
+                    if (isNextMapQueued)
                     {
-                        this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Round 2 started. Voting phase carries over from Round 1.");
+                        try
+                        {
+                            LogLive("[CVotingSystem] [Live]: Cleaning up queued map entry from index 0.");
+                            this.ExecuteCommand("procon.protected.send", "mapList.remove", "0");
+                            this.ExecuteCommand("procon.protected.send", "mapList.save");
+                            this.ExecuteCommand("procon.protected.send", "mapList.list");
+                            isNextMapQueued = false;
+                        }
+                        catch (Exception ex)
+                        {
+                            LogLive("^1Error shifting maplist: " + ex.Message);
+                        }
                     }
+
+                    ResetVotingState(false);
+                    TriggerRoundStartSequence();
                 }
             }
         }
@@ -315,7 +453,9 @@ namespace PRoConEvents
         {
             lock (syncLock)
             {
-                if (currentPhase == VotingPhase.Idle && roundStartDelayTimer == null && !isWaitingForPlayers)
+                LogLive($"[CVotingSystem] [Live]: OnRoundStart triggered. Current Phase: {currentPhase}, WaitingForPlayers: {isWaitingForPlayers}");
+
+                if (currentPhase == VotingPhase.Idle && roundStartDelayTimer == null && !isWaitingForPlayers && !hasVotedThisMatch)
                 {
                     TriggerRoundStartSequence();
                 }
@@ -326,34 +466,39 @@ namespace PRoConEvents
         {
             lock (syncLock)
             {
+                if (hasVotedThisMatch)
+                {
+                    LogLive($"[CVotingSystem] [Live]: Voting already completed for this match. Skipping round start trigger.");
+                    return;
+                }
+
+                LogLive($"[CVotingSystem] [Live]: Evaluating TriggerRoundStartSequence -> PlayerCount: {currentPlayerCount}, MinRequired: {minimumPlayersToVote}");
+
                 if (currentPlayerCount < minimumPlayersToVote)
                 {
                     isWaitingForPlayers = true;
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: Only {currentPlayerCount}/{minimumPlayersToVote} players. Voting postponed until threshold met.");
+                    LogLive($"[CVotingSystem] [Live]: Player count is {currentPlayerCount} (< {minimumPlayersToVote}). Voting countdown postponed, waiting for players to join.");
                     return;
                 }
 
                 isWaitingForPlayers = false;
 
-                if (currentPhase == VotingPhase.Idle)
-                {
-                    ResetVotingState();
-                }
-                else
-                {
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Voting process is already running/persisted. Skipping timer reset.");
-                    return;
-                }
-
                 double delayMs = mapVotingStartDelaySeconds * 1000.0;
                 if (delayMs <= 0) delayMs = 1000.0;
+
+                if (roundStartDelayTimer != null)
+                {
+                    roundStartDelayTimer.Stop();
+                    roundStartDelayTimer.Dispose();
+                    roundStartDelayTimer = null;
+                }
 
                 roundStartDelayTimer = new Timer(delayMs);
                 roundStartDelayTimer.Elapsed += StartMapVotingPhase;
                 roundStartDelayTimer.AutoReset = false;
                 roundStartDelayTimer.Start();
 
-                this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: New round sequence triggered. Map voting scheduled in {mapVotingStartDelaySeconds} seconds.");
+                LogLive($"[CVotingSystem] [Live]: Voting countdown started! Will begin map vote in {mapVotingStartDelaySeconds}s on map {currentActiveMapFriendlyName}.");
             }
         }
 
@@ -361,17 +506,7 @@ namespace PRoConEvents
         {
             lock (syncLock)
             {
-                if (isHeistRoundOne && currentPhase != VotingPhase.GamemodeVotingEnded)
-                {
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", "CVotingSystem: Heist Round 1 ended early. Active voting timers/state will persist into Round 2.");
-                    isHeistRoundOne = false;
-                    return;
-                }
-
-                if (currentPhase != VotingPhase.GamemodeVotingEnded && currentPhase != VotingPhase.Idle)
-                {
-                    this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: Round ended prematurely during phase '{currentPhase}'.");
-                }
+                LogLive($"[CVotingSystem] [Live]: OnRoundOver triggered. Winning Team ID: {winningTeamId}");
 
                 if (currentPhase == VotingPhase.GamemodeVotingEnded)
                 {
@@ -386,12 +521,14 @@ namespace PRoConEvents
             if (roundStartDelayTimer != null) { roundStartDelayTimer.Stop(); roundStartDelayTimer.Dispose(); roundStartDelayTimer = null; }
             if (votingPeriodicTimer != null) { votingPeriodicTimer.Stop(); votingPeriodicTimer.Dispose(); votingPeriodicTimer = null; }
             if (phaseTransitionTimer != null) { phaseTransitionTimer.Stop(); phaseTransitionTimer.Dispose(); phaseTransitionTimer = null; }
+            LogLive("[CVotingSystem] [Live]: All timers stopped and disposed.");
         }
 
-        private void ResetVotingState()
+        private void ResetVotingState(bool clearMemoryTray = false)
         {
             StopAllTimers();
             currentPhase = VotingPhase.Idle;
+            hasVotedThisMatch = false; // Master Match Flag reset
             activeMapPool.Clear();
             activeGamemodePool.Clear();
             mapNominations.Clear();
@@ -404,6 +541,15 @@ namespace PRoConEvents
             winningGamemode = string.Empty;
             mapVotingIntervalCount = 0;
             gamemodeVotingIntervalCount = 0;
+            
+            if (clearMemoryTray)
+            {
+                isWaitingForRoundTwoInjection = false;
+                storedRoundTwoMap = string.Empty;
+                storedRoundTwoMode = string.Empty;
+            }
+
+            LogLive("[CVotingSystem] [Live]: Voting state completely reset to Idle.");
         }
 
         #endregion
@@ -425,6 +571,13 @@ namespace PRoConEvents
                 BuildMapPool();
                 mapVotingIntervalCount = 0;
 
+                LogLive("[CVotingSystem] [Live]: Map voting phase has officially started.");
+                foreach (var map in activeMapPool)
+                {
+                    string selectionType = mapNominations.ContainsValue(map) ? "nominated" : "random";
+                    LogLive($"[CVotingSystem] [Live] -> Pool Map: {map} ({selectionType})");
+                }
+
                 SendMultiLineGlobalChat(BuildMapVotingMessage("MAP VOTING STARTS NOW:"));
 
                 int intervalMs = votingStatusUpdateIntervalSeconds * 1000;
@@ -443,6 +596,7 @@ namespace PRoConEvents
             {
                 mapVotingIntervalCount++;
                 int mapVotingIntervals = Math.Max(1, (int)Math.Ceiling((double)mapVotingDurationSeconds / votingStatusUpdateIntervalSeconds));
+                LogLive($"[CVotingSystem] [Live]: Map voting periodic update {mapVotingIntervalCount}/{mapVotingIntervals}");
 
                 if (mapVotingIntervalCount < mapVotingIntervals)
                 {
@@ -466,12 +620,17 @@ namespace PRoConEvents
             activeMapPool.Clear();
             List<string> candidateMaps = new List<string>(allPossibleMaps);
 
+            if (!string.IsNullOrEmpty(currentActiveMapFriendlyName))
+            {
+                candidateMaps.RemoveAll(m => m.Equals(currentActiveMapFriendlyName, StringComparison.OrdinalIgnoreCase));
+            }
+
             foreach (var kvp in mapNominations)
             {
                 if (!activeMapPool.Contains(kvp.Value) && activeMapPool.Count < 8)
                 {
                     activeMapPool.Add(kvp.Value);
-                    candidateMaps.Remove(kvp.Value);
+                    candidateMaps.RemoveAll(m => m.Equals(kvp.Value, StringComparison.OrdinalIgnoreCase));
                 }
             }
 
@@ -538,6 +697,16 @@ namespace PRoConEvents
             }
 
             winningMap = tiedMaps.Count > 0 ? tiedMaps[rnd.Next(tiedMaps.Count)] : (activeMapPool.Count > 0 ? activeMapPool[0] : "Bank Job");
+            bool isTieBreaker = tiedMaps.Count > 1;
+
+            if (isTieBreaker)
+            {
+                LogLive($"[CVotingSystem] [Live]: Map vote ended. Winner: {winningMap} with {maxVotes} votes (Tie breaker resolved).");
+            }
+            else
+            {
+                LogLive($"[CVotingSystem] [Live]: Map vote ended. Winner: {winningMap} with {maxVotes} votes.");
+            }
 
             SendGlobalChat($"{winningMap} has won the voting starting gamemode voting now !");
 
@@ -569,6 +738,13 @@ namespace PRoConEvents
                 BuildGamemodePool(winningMap);
                 gamemodeVotingIntervalCount = 0;
 
+                LogLive($"[CVotingSystem] [Live]: Gamemode voting phase started for winning map: {winningMap}");
+                foreach (var mode in activeGamemodePool)
+                {
+                    string selectionType = gamemodeNominations.ContainsValue(mode) ? "nominated" : "random";
+                    LogLive($"[CVotingSystem] [Live] -> Pool Mode: {mode} ({selectionType})");
+                }
+
                 SendMultiLineGlobalChat(BuildGamemodeVotingMessage($"GAMEMODE VOTING FOR MAP {winningMap} HAS STARTED"));
 
                 int intervalMs = votingStatusUpdateIntervalSeconds * 1000;
@@ -587,6 +763,7 @@ namespace PRoConEvents
             {
                 gamemodeVotingIntervalCount++;
                 int modeVotingIntervals = Math.Max(1, (int)Math.Ceiling((double)modeVotingDurationSeconds / votingStatusUpdateIntervalSeconds));
+                LogLive($"[CVotingSystem] [Live]: Gamemode voting periodic update {gamemodeVotingIntervalCount}/{modeVotingIntervals}");
 
                 if (gamemodeVotingIntervalCount < modeVotingIntervals)
                 {
@@ -682,6 +859,7 @@ namespace PRoConEvents
         private void EndGamemodeVoting()
         {
             currentPhase = VotingPhase.GamemodeVotingEnded;
+            hasVotedThisMatch = true; // Lock out further votes for this match
 
             int maxVotes = -1;
             List<string> tiedModes = new List<string>();
@@ -703,10 +881,47 @@ namespace PRoConEvents
 
             winningGamemode = tiedModes.Count > 0 ? tiedModes[rnd.Next(tiedModes.Count)] : (activeGamemodePool.Count > 0 ? activeGamemodePool[0] : "Blood Money");
 
+            int mapVotesCount = mapVotes.ContainsKey(winningMap) ? mapVotes[winningMap] : 0;
+            int modeVotesCount = gamemodeVotes.ContainsKey(winningGamemode) ? gamemodeVotes[winningGamemode] : 0;
+
+            LogLive($"[CVotingSystem] [Live]: Gamemode vote ended. Winner: {winningMap} [{winningGamemode}] with Map Votes: {mapVotesCount}, Mode Votes: {modeVotesCount}");
+            
             SendGlobalChat("Map voting has finished the next map will be:");
             SendGlobalChat($"{winningMap} [{winningGamemode}] !");
 
-            ApplyNextMapMidRound();
+            TryExecuteOrQueueInjection();
+        }
+
+        #endregion
+
+        #region Injection Timing Handlers
+
+        private void TryExecuteOrQueueInjection()
+        {
+            bool currentIsMultiRound = IsHeistOrSquadHeist(currentActiveGamemodeInternalName);
+
+            if (currentIsMultiRound)
+            {
+                if (currentRoundsPlayed == 0)
+                {
+                    storedRoundTwoMap = winningMap;
+                    storedRoundTwoMode = winningGamemode;
+                    isWaitingForRoundTwoInjection = true;
+
+                    LogLive($"[CVotingSystem] [Live]: Currently on Round 1/2 of {currentActiveGamemodeFriendlyName}. Storing winner ({winningMap} [{winningGamemode}]) in memory tray.");
+                    LogLive("[CVotingSystem] [Live]: Waiting until Round 2/2 starts to inject.");
+                }
+                else
+                {
+                    LogLive($"[CVotingSystem] [Live]: Currently on Round 2/2 of {currentActiveGamemodeFriendlyName}. Injecting map instantly.");
+                    ApplyNextMapMidRound();
+                }
+            }
+            else
+            {
+                LogLive($"[CVotingSystem] [Live]: Single-round mode detected ({currentActiveGamemodeFriendlyName}). Injecting map instantly.");
+                ApplyNextMapMidRound();
+            }
         }
 
         #endregion
@@ -722,7 +937,7 @@ namespace PRoConEvents
             string cleanMessage = strMessage.Trim();
             if (strSpeaker == "Server") return;
 
-            bool isAdmin = strSpeaker.Equals("kanus15elef", StringComparison.OrdinalIgnoreCase);
+            bool isAdmin = IsAuthorized(strSpeaker);
 
             lock (syncLock)
             {
@@ -730,15 +945,34 @@ namespace PRoConEvents
                 {
                     if (!isAdmin) { SendPlayerChat(strSpeaker, "you don't have permission to execute those commands"); return; }
                     isWaitingForPlayers = false; 
-                    if (currentPhase == VotingPhase.Idle) { SendGlobalChat("Admin has forcefully started the voting process!"); StartMapVotingPhase(null, null); }
+                    if (currentPhase == VotingPhase.Idle) 
+                    { 
+                        hasVotedThisMatch = false; // Allow admin to force a new vote even if one completed
+                        LogLive($"[CVotingSystem] [Live]: Admin ({strSpeaker}) forcefully started voting via !votestart.");
+                        SendGlobalChat("Admin has forcefully started the voting process!"); 
+                        StartMapVotingPhase(null, null); 
+                    }
                     else { SendPlayerChat(strSpeaker, "Voting is already active or finished."); }
                     return;
                 }
 
                 if (cleanMessage.Equals("!voterefresh", StringComparison.OrdinalIgnoreCase))
                 {
-                    if (!isAdmin) { SendPlayerChat(strSpeaker, "you don't have permission to execute those commands"); return; }
-                    ResetVotingState();
+                    if (!isAdmin) 
+                    { 
+                        SendPlayerChat(strSpeaker, "you don't have permission to execute those commands"); 
+                        return; 
+                    }
+
+                    try
+                    {
+                        this.ExecuteCommand("procon.protected.send", "mapList.remove", "1");
+                        this.ExecuteCommand("procon.protected.send", "mapList.list");
+                    }
+                    catch { }
+
+                    ResetVotingState(true);
+                    LogLive($"[CVotingSystem] [Live]: Admin ({strSpeaker}) executed !voterefresh. Reset state and cleared queued rotation.");
                     SendGlobalChat("all voting stages has been deleted and clear");
                     return;
                 }
@@ -748,11 +982,13 @@ namespace PRoConEvents
                     if (!isAdmin) { SendPlayerChat(strSpeaker, "you don't have permission to execute those commands"); return; }
                     if (currentPhase == VotingPhase.MapVoting)
                     {
+                        LogLive($"[CVotingSystem] [Live]: Admin ({strSpeaker}) forcefully ended map voting.");
                         if (votingPeriodicTimer != null) { votingPeriodicTimer.Stop(); votingPeriodicTimer.Dispose(); votingPeriodicTimer = null; }
                         EndMapVoting();
                     }
                     else if (currentPhase == VotingPhase.GamemodeVoting)
                     {
+                        LogLive($"[CVotingSystem] [Live]: Admin ({strSpeaker}) forcefully ended gamemode voting.");
                         if (votingPeriodicTimer != null) { votingPeriodicTimer.Stop(); votingPeriodicTimer.Dispose(); votingPeriodicTimer = null; }
                         EndGamemodeVoting();
                     }
@@ -782,6 +1018,11 @@ namespace PRoConEvents
                     HandleGamemodeNomination(strSpeaker, cleanMessage.Substring(13).Trim());
                     return;
                 }
+                if (cleanMessage.StartsWith("!nommode ", StringComparison.OrdinalIgnoreCase))
+                {
+                    HandleGamemodeNomination(strSpeaker, cleanMessage.Substring(9).Trim());
+                    return;
+                }
 
                 if (currentPhase == VotingPhase.MapVoting && int.TryParse(cleanMessage, out int mapChoice))
                 {
@@ -796,6 +1037,7 @@ namespace PRoConEvents
                                 mapVotes[oldMap] = Math.Max(0, mapVotes[oldMap] - 1);
                                 mapVotes[chosenMap]++;
                                 playerCurrentMapVote[strSpeaker] = chosenMap;
+                                LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} changed map vote from {oldMap} to {chosenMap}");
                                 SendGlobalChat($"{strSpeaker} has changed its voting from {oldMap} to {chosenMap} !");
                             }
                         }
@@ -803,6 +1045,7 @@ namespace PRoConEvents
                         {
                             playerCurrentMapVote[strSpeaker] = chosenMap;
                             mapVotes[chosenMap]++;
+                            LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} voted for map {chosenMap}");
                             SendGlobalChat($"{strSpeaker} has voted for {chosenMap} !");
                         }
                     }
@@ -822,6 +1065,7 @@ namespace PRoConEvents
                                 gamemodeVotes[oldMode] = Math.Max(0, gamemodeVotes[oldMode] - 1);
                                 gamemodeVotes[chosenMode]++;
                                 playerCurrentGamemodeVote[strSpeaker] = chosenMode;
+                                LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} changed mode vote from {oldMode} to {chosenMode}");
                                 SendGlobalChat($"{strSpeaker} has changed its voting from the map {winningMap} [{oldMode}] to the map {winningMap} [{chosenMode}] !");
                             }
                         }
@@ -829,6 +1073,7 @@ namespace PRoConEvents
                         {
                             playerCurrentGamemodeVote[strSpeaker] = chosenMode;
                             gamemodeVotes[chosenMode]++;
+                            LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} voted for mode {chosenMode}");
                             SendGlobalChat($"{strSpeaker} has voted for the map {winningMap} [{chosenMode}] !");
                         }
                     }
@@ -873,12 +1118,14 @@ namespace PRoConEvents
             {
                 string oldNom = mapNominations[playerName];
                 mapNominations[playerName] = matchedMap;
+                LogLive($"[CVotingSystem] [Live]: Player {playerName} changed map nomination from {oldNom} to {matchedMap}");
                 SendGlobalChat($"{playerName} has changed its nomination from {oldNom} to {matchedMap}");
             }
             else
             {
                 if (mapNominations.Count >= 8) { SendPlayerChat(playerName, "All nomination slots have been taken you cant nominate for a map!"); return; }
                 mapNominations[playerName] = matchedMap;
+                LogLive($"[CVotingSystem] [Live]: Player {playerName} nominated map {matchedMap}");
                 SendGlobalChat($"{playerName} has nominated for map {matchedMap} !");
             }
         }
@@ -893,12 +1140,14 @@ namespace PRoConEvents
             {
                 string oldNom = gamemodeNominations[playerName];
                 gamemodeNominations[playerName] = matchedMode;
+                LogLive($"[CVotingSystem] [Live]: Player {playerName} changed gamemode nomination from {oldNom} to {matchedMode}");
                 SendGlobalChat($"{playerName} has changed its nomination gamemode nomination from {oldNom} to {matchedMode}");
             }
             else
             {
-                if (gamemodeNominations.Count >= 8) { SendPlayerChat(playerName, "All nomination slots have been taken you cant nominate for a gamemode!"); return; }
+                if (gamemodeNominations.Count >= 8) { SendPlayerChat(playerName, "All gamemode nomination slots have been taken you cant nominate for a gamemode!"); return; }
                 gamemodeNominations[playerName] = matchedMode;
+                LogLive($"[CVotingSystem] [Live]: Player {playerName} nominated gamemode {matchedMode}");
                 SendGlobalChat($"{playerName} has nominated for gamemode {matchedMode} !");
             }
         }
@@ -1021,36 +1270,75 @@ namespace PRoConEvents
 
         private string GetInternalMapName(string friendlyName)
         {
+            if (string.IsNullOrEmpty(friendlyName)) return friendlyName;
             switch (friendlyName.ToLower())
             {
-                case "bank job": return "MP_Bank";
-                case "derailed": return "MP_Derailed";
                 case "downtown": return "MP_Downtown";
-                case "dustbowl": return "MP_Dustbowl";
-                case "everglades": return "MP_Everglades";
-                case "growhouse": return "MP_Growhouse";
-                case "hollywoods heights": return "MP_Hollywood";
-                case "night job": return "MP_Bank_Night";
-                case "night woods": return "MP_Eastside_Night";
-                case "riptide": return "MP_Bayside";
                 case "the block": return "MP_Bloodout";
-                case "backwoods": return "XP1_Backwoods";
-                case "black friday": return "XP2_Mall";
-                case "code blue": return "XP2_Precinct";
-                case "the beat": return "XP2_TheBeat";
-                case "break pointe": return "XP3_Border";
-                case "museum": return "XP3_Museum";
-                case "precinct 7": return "XP3_Precinct7";
-                case "the docks": return "XP3_Docks";
-                case "diversion": return "XP4_Diversion";
-                case "double cross": return "XP4_DoubleCross";
-                case "pacific highway": return "XP4_PacificHwy";
-                case "train dodge": return "XP4_TrainDodge";
-                case "alcatraz": return "XP4_Alcatraz";
-                case "chinatown": return "XP4_Chinatown";
-                case "cemetery": return "XP4_Cemetery";
-                case "thin ice": return "XP4_ThinIce";
+                case "derailed": return "MP_Eastside";
+                case "dustbowl": return "MP_Desert05";
+                case "bank job": return "MP_Bank";
+                case "growhouse": return "MP_Growhouse";
+                case "riptide": return "MP_Offshore";
+                case "hollywoods heights":
+                case "hollywood heights": return "MP_Hills";
+                case "everglades": return "MP_Glades";
+                case "black friday": return "XP1_Mallcops";
+                case "code blue": return "XP1_Nights";
+                case "the beat": return "XP1_Projects";
+                case "backwoods": return "XP1_Sawmill";
+                case "the docks": return "xp2_cargoship";
+                case "break pointe":
+                case "break point": return "xp2_coastal";
+                case "museum": return "xp2_museum02";
+                case "precinct 7": return "xp2_precinct7";
+                case "night job": return "xp25_bank";
+                case "night woods": return "xp25_sawmill";
+                case "double cross": return "xp3_border";
+                case "diversion": return "xp3_cistern02";
+                case "pacific highway": return "xp3_highway";
+                case "train dodge": return "xp3_traindodge";
+                case "alcatraz": return "xp4_alcatraz";
+                case "cemetery": return "xp4_cemetery";
+                case "chinatown": return "xp4_chinatown";
+                case "thin ice": return "xp4_snowcrash";
                 default: return friendlyName;
+            }
+        }
+
+        private string GetFriendlyMapName(string internalName)
+        {
+            if (string.IsNullOrEmpty(internalName)) return internalName;
+            switch (internalName.ToLower())
+            {
+                case "mp_downtown": return "Downtown";
+                case "mp_bloodout": return "The Block";
+                case "mp_eastside": return "Derailed";
+                case "mp_desert05": return "Dustbowl";
+                case "mp_bank": return "Bank Job";
+                case "mp_growhouse": return "Growhouse";
+                case "mp_offshore": return "Riptide";
+                case "mp_hills": return "Hollywoods Heights";
+                case "mp_glades": return "Everglades";
+                case "xp1_mallcops": return "Black Friday";
+                case "xp1_nights": return "Code Blue";
+                case "xp1_projects": return "The Beat";
+                case "xp1_sawmill": return "Backwoods";
+                case "xp2_cargoship": return "The Docks";
+                case "xp2_coastal": return "Break pointe";
+                case "xp2_museum02": return "Museum";
+                case "xp2_precinct7": return "Precinct 7";
+                case "xp25_bank": return "Night Job";
+                case "xp25_sawmill": return "Night Woods";
+                case "xp3_border": return "Double Cross";
+                case "xp3_cistern02": return "Diversion";
+                case "xp3_highway": return "Pacific Highway";
+                case "xp3_traindodge": return "Train Dodge";
+                case "xp4_alcatraz": return "Alcatraz";
+                case "xp4_cemetery": return "Cemetery";
+                case "xp4_chinatown": return "Chinatown";
+                case "xp4_snowcrash": return "Thin Ice";
+                default: return internalName;
             }
         }
 
@@ -1059,17 +1347,47 @@ namespace PRoConEvents
             switch (friendlyName.ToLower())
             {
                 case "blood money": return "BloodMoney0";
-                case "rescue": return "Rescue0";
+                case "rescue": return "Hostage0";
                 case "heist": return "Heist0";
-                case "crosshair": return "Crosshair0";
+                case "crosshair": return "Hit0";
                 case "squad heist": return "SquadHeist0";
-                case "conquest": return "ConquestSmall0";
-                case "conquest large": return "ConquestLarge0";
+                case "conquest": return "TurfWarSmall0";
+                case "conquest large": return "TurfWarLarge0";
                 case "team deathmatch": return "TeamDeathMatch0";
                 case "hotwire": return "Hotwire0";
-                case "capture the bag": return "CaptureTheBag0";
-                case "bounty hunter": return "BountyHunter0";
+                case "capture the bag": return "CaptureTheFlag0";
+                case "bounty hunter": return "CashGrab0";
                 default: return friendlyName;
+            }
+        }
+
+        private string GetFriendlyModeName(string internalName)
+        {
+            switch (internalName.ToLower())
+            {
+                case "bloodmoney0":
+                case "blood money": return "Blood Money";
+                case "hostage0":
+                case "rescue": return "Rescue";
+                case "heist0":
+                case "heist": return "Heist";
+                case "hit0":
+                case "crosshair": return "Crosshair";
+                case "squadheist0":
+                case "squad heist": return "Squad Heist";
+                case "turfwarsmall0":
+                case "conquest": return "Conquest";
+                case "turfwarlarge0":
+                case "conquest large": return "Conquest Large";
+                case "teamdeathmatch0":
+                case "team deathmatch": return "Team Deathmatch";
+                case "hotwire0":
+                case "hotwire": return "Hotwire";
+                case "capturetheflag0":
+                case "capture the bag": return "Capture The Bag";
+                case "cashgrab0":
+                case "bounty hunter": return "Bounty Hunter";
+                default: return internalName;
             }
         }
 
@@ -1079,18 +1397,22 @@ namespace PRoConEvents
             {
                 string internalMap = GetInternalMapName(winningMap);
                 string internalMode = GetInternalModeName(winningGamemode);
+                string injectedRounds = IsHeistOrSquadHeist(internalMode) ? "2" : "1";
+
+                LogLive($"[CVotingSystem] [Live]: [Injection] Applying next map: {internalMap} [{internalMode}] with {injectedRounds} rounds");
+
+                this.ExecuteCommand("procon.protected.send", "mapList.remove", "1");
+                this.ExecuteCommand("procon.protected.send", "mapList.add", internalMap, internalMode, injectedRounds);
+                this.ExecuteCommand("procon.protected.send", "mapList.setNextMapIndex", "1");
                 
-                string injectedRounds = IsHeist(internalMode) || internalMode.Equals("SquadHeist0", StringComparison.OrdinalIgnoreCase) ? "2" : "1";
-
-                this.ExecuteCommand("procon.protected.pluginconsole.write", $"CVotingSystem: [Mid-Round] Injecting UI map update: {internalMap} [{internalMode}] at index 1");
-
-                this.ExecuteCommand("procon.protected.send", "mapList.add", internalMap, internalMode, injectedRounds, "1");
                 this.ExecuteCommand("procon.protected.send", "mapList.save");
                 this.ExecuteCommand("procon.protected.send", "mapList.list");
+
+                isNextMapQueued = true;
             }
             catch (Exception ex)
             {
-                this.ExecuteCommand("procon.protected.pluginconsole.write", "^1Error mid-round maplist update: " + ex.Message);
+                LogLive("^1Error maplist injection update: " + ex.Message);
             }
         }
 
