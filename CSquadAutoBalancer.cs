@@ -12,12 +12,12 @@ namespace PRoConEvents
     {
         // --- MANDATORY PLUGIN INTERFACE INFO ---
         public string GetPluginName() { return "Squad Auto Balancer"; }
-        public string GetPluginVersion() { return "1.5.1"; }
+        public string GetPluginVersion() { return "2.0.0"; }
         public string GetPluginAuthor() { return "Yonatan (kanus15elef)"; }
         public string GetPluginWebsite() { return "localhost"; }
-        public string GetPluginDescription() { return "Optimized balancing with persistent Heist round-tracking, exact equal player counts, strict squad preservation, and automatic in-game squad assignments."; }
+        public string GetPluginDescription() { return "Optimized match-end balancing with squad preservation, post-process solo swapping, and !stats lookup."; }
 
-        // --- Configurable plugin variables (exposed to server admins) ---
+        // --- Configurable plugin variables ---
         private double scoreWeight = 0.01;   
         private double kdWeight = 10.0;      
         private double killWeight = 5.0;     
@@ -25,6 +25,10 @@ namespace PRoConEvents
         private bool preserveSquads = true;  
         private int balanceDelaySeconds = 5; 
         private int scoreRequestTimeoutMs = 2000; 
+        
+        private int assistEnableDelayMinutes = 5;
+        private int nukeTriggerMinutes = 2;
+        private int nukeDurationSeconds = 30;
 
         public List<CPluginVariable> GetDisplayPluginVariables()
         {
@@ -36,7 +40,10 @@ namespace PRoConEvents
                 new CPluginVariable("inviteExpirySeconds", typeof(int), inviteExpirySeconds.ToString()),
                 new CPluginVariable("preserveSquads", typeof(bool), preserveSquads.ToString()),
                 new CPluginVariable("balanceDelaySeconds", typeof(int), balanceDelaySeconds.ToString()),
-                new CPluginVariable("scoreRequestTimeoutMs", typeof(int), scoreRequestTimeoutMs.ToString())
+                new CPluginVariable("scoreRequestTimeoutMs", typeof(int), scoreRequestTimeoutMs.ToString()),
+                new CPluginVariable("assistEnableDelayMinutes", typeof(int), assistEnableDelayMinutes.ToString()),
+                new CPluginVariable("nukeTriggerMinutes", typeof(int), nukeTriggerMinutes.ToString()),
+                new CPluginVariable("nukeDurationSeconds", typeof(int), nukeDurationSeconds.ToString())
             };
         }
 
@@ -55,6 +62,9 @@ namespace PRoConEvents
                     case "preserveSquads": preserveSquads = bool.Parse(strValue); break;
                     case "balanceDelaySeconds": balanceDelaySeconds = int.Parse(strValue); break;
                     case "scoreRequestTimeoutMs": scoreRequestTimeoutMs = int.Parse(strValue); break;
+                    case "assistEnableDelayMinutes": assistEnableDelayMinutes = int.Parse(strValue); break;
+                    case "nukeTriggerMinutes": nukeTriggerMinutes = int.Parse(strValue); break;
+                    case "nukeDurationSeconds": nukeDurationSeconds = int.Parse(strValue); break;
                 }
             }
             catch { /* ignore invalid values */ }
@@ -71,11 +81,9 @@ namespace PRoConEvents
             public string CurrentSquadName { get; set; }
             public string UniqueId { get; set; } 
             public int PreviousRoundCalculatedScore { get; set; } 
-
-            public double KD
-            {
-                get { return (double)Kills / Math.Max(1, Deaths); }
-            }
+            
+            public bool IsAFK { get { return OverallScore == 0 && Kills == 0; } }
+            public double KD { get { return (double)Kills / Math.Max(1, Deaths); } }
 
             public int CalculatedPlayerScore(double scoreWeight, double kdWeight, double killWeight)
             {
@@ -107,18 +115,12 @@ namespace PRoConEvents
             public string LeaderName { get; set; }
             public List<CustomPlayer> Members { get; set; }
 
-            public CustomSquad()
-            {
-                Members = new List<CustomPlayer>();
-            }
+            public CustomSquad() { Members = new List<CustomPlayer>(); }
 
             public int TotalScore(double scoreWeight, double kdWeight, double killWeight)
             {
                 int total = 0;
-                for (int i = 0; i < Members.Count; i++)
-                {
-                    total += Members[i].CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
-                }
+                for (int i = 0; i < Members.Count; i++) total += Members[i].CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
                 return total;
             }
         }
@@ -126,22 +128,13 @@ namespace PRoConEvents
         public class BalanceGroup
         {
             public List<CustomPlayer> Players { get; set; }
-
-            public BalanceGroup()
-            {
-                Players = new List<CustomPlayer>();
-            }
-
+            public BalanceGroup() { Players = new List<CustomPlayer>(); }
             public int TotalScore(double scoreWeight, double kdWeight, double killWeight)
             {
                 int total = 0;
-                for (int i = 0; i < Players.Count; i++)
-                {
-                    total += Players[i].CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
-                }
+                for (int i = 0; i < Players.Count; i++) total += Players[i].CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
                 return total;
             }
-
             public int Size { get { return Players.Count; } }
         }
 
@@ -156,46 +149,42 @@ namespace PRoConEvents
             }
         }
 
-        // --- Thread-safe collections and locks ---
+        // --- State Collections ---
         private readonly Dictionary<string, CustomSquad> activeSquads = new Dictionary<string, CustomSquad>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CustomPlayer> trackedPlayers = new Dictionary<string, CustomPlayer>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, InviteInfo> pendingInvites = new Dictionary<string, InviteInfo>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CustomPlayer> matchProfiles = new Dictionary<string, CustomPlayer>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, ManualResetEventSlim> pendingScoreRequests = new Dictionary<string, ManualResetEventSlim>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, int> authorizedTeams = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
         private readonly object stateLock = new object();
         private readonly Random randomGen = new Random();
 
-        private readonly Dictionary<string, CustomPlayer> matchProfiles = new Dictionary<string, CustomPlayer>(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<string, ManualResetEventSlim> pendingScoreRequests = new Dictionary<string, ManualResetEventSlim>(StringComparer.OrdinalIgnoreCase);
-
-        // Persistent Heist State Trackers (Fixes round-reset loop bug)
         private bool isMatchRunning = true; 
         private string currentGameMode = "";
-        private string currentMapName = "";
-        private int persistentHeistRound = 0;
+        private int heistRoundCount = 0;
         private Dictionary<string, int> previousRoundScores = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        
+        private List<CustomPlayer> pendingMapChangeLobbySnapshot = null;
+        private List<CustomSquad> pendingMapChangeSquadsSnapshot = null;
 
-        public CSquadAutoBalancer()
-        {
-        }
+        private DateTime matchStartTime = DateTime.UtcNow;
+        private bool teamANuked = false;
+        private bool teamBNuked = false;
+        private DateTime teamANukeEndTime;
+        private DateTime teamBNukeEndTime;
+
+        public CSquadAutoBalancer() { }
 
         public void OnPluginLoaded(string strHostName, string strPort, string strPRoConVersion)
         {
             this.RegisterEvents(this.GetType().Name,
-                "OnGlobalChat",
-                "OnRoundOver",
-                "OnPlayerJoin",
-                "OnPlayerLeft",
-                "OnPlayerKilled",
-                "OnListPlayers",
-                "OnPlayerTeamChange",
-                "OnServerInfo",
-                "OnLevelLoaded");
+                "OnGlobalChat", "OnRoundOver", "OnPlayerJoin", "OnPlayerLeft", 
+                "OnPlayerKilled", "OnListPlayers", "OnPlayerTeamChange", 
+                "OnServerInfo", "OnLevelLoaded", "OnPlayerSpawned");
         }
 
-        public void OnPluginEnable()
-        {
-            SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Enabled!");
-        }
-
+        public void OnPluginEnable() { SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Balancer 2.1.0 Enabled!"); }
         public void OnPluginDisable() { }
 
         public override void OnServerInfo(CServerInfo serverInfo)
@@ -206,25 +195,38 @@ namespace PRoConEvents
             }
         }
 
-        // Persistent Round Tracker inside OnLevelLoaded
         public override void OnLevelLoaded(string mapFileName, string GameMode, int roundsPlayed, int roundsTotal)
         {
             lock (stateLock)
             {
                 this.currentGameMode = GameMode;
+                this.heistRoundCount = roundsPlayed; 
+                this.previousRoundScores.Clear();
+                this.authorizedTeams.Clear(); 
+                
+                this.matchStartTime = DateTime.UtcNow;
+                this.teamANuked = false;
+                this.teamBNuked = false;
+            }
 
-                if (string.Equals(this.currentMapName, mapFileName, StringComparison.OrdinalIgnoreCase))
+            if (pendingMapChangeLobbySnapshot != null && pendingMapChangeSquadsSnapshot != null)
+            {
+                List<CustomPlayer> lobby = pendingMapChangeLobbySnapshot;
+                List<CustomSquad> squads = pendingMapChangeSquadsSnapshot;
+                
+                pendingMapChangeLobbySnapshot = null;
+                pendingMapChangeSquadsSnapshot = null;
+
+                ThreadPool.QueueUserWorkItem(_ =>
                 {
-                    // Same map, round transitioned (e.g., Heist Round 2)
-                    this.persistentHeistRound++;
-                }
-                else
-                {
-                    // Completely new map: Reset round counter and scores cache
-                    this.currentMapName = mapFileName;
-                    this.persistentHeistRound = 0;
-                    this.previousRoundScores.Clear();
-                }
+                    try
+                    {
+                        Thread.Sleep(2000); 
+                        RunBalancer(lobby, squads);
+                        lock (stateLock) { matchProfiles.Clear(); }
+                    }
+                    catch (Exception ex) { TryLogConsole("OnLevelLoaded Balancer error: " + ex.Message); }
+                });
             }
         }
 
@@ -232,15 +234,8 @@ namespace PRoConEvents
         {
             lock (stateLock)
             {
-                if (!trackedPlayers.ContainsKey(strSoldierName))
-                {
-                    trackedPlayers[strSoldierName] = new CustomPlayer { Name = strSoldierName, OverallScore = 0, Kills = 0, Deaths = 0, TeamId = 0 };
-                }
-
-                if (!matchProfiles.ContainsKey(strSoldierName))
-                {
-                    matchProfiles[strSoldierName] = new CustomPlayer { Name = strSoldierName, OverallScore = 0, Kills = 0, Deaths = 0, TeamId = 0 };
-                }
+                if (!trackedPlayers.ContainsKey(strSoldierName)) trackedPlayers[strSoldierName] = new CustomPlayer { Name = strSoldierName };
+                if (!matchProfiles.ContainsKey(strSoldierName)) matchProfiles[strSoldierName] = new CustomPlayer { Name = strSoldierName };
             }
         }
 
@@ -255,18 +250,12 @@ namespace PRoConEvents
                     if (!string.IsNullOrEmpty(player.CurrentSquadName) && activeSquads.ContainsKey(player.CurrentSquadName))
                     {
                         activeSquads[player.CurrentSquadName].Members.Remove(player);
-                        if (activeSquads[player.CurrentSquadName].Members.Count == 0)
-                        {
-                            activeSquads.Remove(player.CurrentSquadName);
-                        }
+                        if (activeSquads[player.CurrentSquadName].Members.Count == 0) activeSquads.Remove(player.CurrentSquadName);
                     }
                     trackedPlayers.Remove(strSoldierName);
                 }
-
-                if (matchProfiles.ContainsKey(strSoldierName))
-                {
-                    matchProfiles.Remove(strSoldierName);
-                }
+                matchProfiles.Remove(strSoldierName);
+                authorizedTeams.Remove(strSoldierName);
             }
         }
 
@@ -276,19 +265,13 @@ namespace PRoConEvents
             {
                 foreach (CPlayerInfo p in players)
                 {
-                    if (!matchProfiles.ContainsKey(p.SoldierName))
-                    {
-                        matchProfiles[p.SoldierName] = new CustomPlayer { Name = p.SoldierName };
-                    }
+                    if (!matchProfiles.ContainsKey(p.SoldierName)) matchProfiles[p.SoldierName] = new CustomPlayer { Name = p.SoldierName };
                     matchProfiles[p.SoldierName].OverallScore = p.Score;
                     matchProfiles[p.SoldierName].Kills = p.Kills;
                     matchProfiles[p.SoldierName].Deaths = p.Deaths;
                     matchProfiles[p.SoldierName].TeamId = p.TeamID;
 
-                    if (!trackedPlayers.ContainsKey(p.SoldierName))
-                    {
-                        trackedPlayers[p.SoldierName] = new CustomPlayer { Name = p.SoldierName };
-                    }
+                    if (!trackedPlayers.ContainsKey(p.SoldierName)) trackedPlayers[p.SoldierName] = new CustomPlayer { Name = p.SoldierName };
                     trackedPlayers[p.SoldierName].OverallScore = p.Score;
                     trackedPlayers[p.SoldierName].Kills = p.Kills;
                     trackedPlayers[p.SoldierName].Deaths = p.Deaths;
@@ -306,21 +289,27 @@ namespace PRoConEvents
         {
             lock (stateLock)
             {
-                if (!string.IsNullOrEmpty(killerName))
+                if (!string.IsNullOrEmpty(killerName) && trackedPlayers.ContainsKey(killerName)) trackedPlayers[killerName].Kills++;
+                if (!string.IsNullOrEmpty(victimName) && trackedPlayers.ContainsKey(victimName)) trackedPlayers[victimName].Deaths++;
+            }
+        }
+        
+        public void OnPlayerSpawned(string soldierName)
+        {
+            lock (stateLock)
+            {
+                if (!trackedPlayers.ContainsKey(soldierName)) return;
+                int team = trackedPlayers[soldierName].TeamId;
+                
+                if (team == 1 && teamANuked && DateTime.UtcNow < teamANukeEndTime)
                 {
-                    if (!trackedPlayers.ContainsKey(killerName)) trackedPlayers[killerName] = new CustomPlayer { Name = killerName };
-                    if (!matchProfiles.ContainsKey(killerName)) matchProfiles[killerName] = new CustomPlayer { Name = killerName };
-                    
-                    trackedPlayers[killerName].Kills++;
-                    matchProfiles[killerName].Kills++;
+                    SafeExecuteCommand("procon.protected.send", "admin.killPlayer", soldierName);
+                    SendChat(soldierName, "Your team is currently NUKED for spawn trapping.");
                 }
-                if (!string.IsNullOrEmpty(victimName))
+                else if (team == 2 && teamBNuked && DateTime.UtcNow < teamBNukeEndTime)
                 {
-                    if (!trackedPlayers.ContainsKey(victimName)) trackedPlayers[victimName] = new CustomPlayer { Name = victimName };
-                    if (!matchProfiles.ContainsKey(victimName)) matchProfiles[victimName] = new CustomPlayer { Name = victimName };
-                    
-                    trackedPlayers[victimName].Deaths++;
-                    matchProfiles[victimName].Deaths++;
+                    SafeExecuteCommand("procon.protected.send", "admin.killPlayer", soldierName);
+                    SendChat(soldierName, "Your team is currently NUKED for spawn trapping.");
                 }
             }
         }
@@ -331,6 +320,22 @@ namespace PRoConEvents
             {
                 if (trackedPlayers.ContainsKey(soldierName)) trackedPlayers[soldierName].TeamId = teamId;
                 if (matchProfiles.ContainsKey(soldierName)) matchProfiles[soldierName].TeamId = teamId;
+
+                if (authorizedTeams.ContainsKey(soldierName))
+                {
+                    int expectedTeam = authorizedTeams[soldierName];
+                    if (expectedTeam != teamId && expectedTeam != 0)
+                    {
+                        SafeExecuteCommand("procon.protected.send", "admin.movePlayer", soldierName, expectedTeam.ToString(), "0", "true");
+                        SendChat(soldierName, "Manual team switching via menu is disabled. Use !assist.");
+                        trackedPlayers[soldierName].TeamId = expectedTeam; 
+                        return;
+                    }
+                }
+                else
+                {
+                    authorizedTeams[soldierName] = teamId;
+                }
             }
         }
 
@@ -354,41 +359,16 @@ namespace PRoConEvents
 
             switch (command)
             {
-                case "!squadcreate":
-                    if (args.Length < 2) return;
-                    string squadName = strMessage.Substring(args[0].Length).Trim();
-                    CreateSquad(speaker, squadName);
-                    break;
-                case "!squadinvite":
-                    if (args.Length < 2) return;
-                    CustomPlayer target = FindPlayer(args[1]);
-                    if (target != null) InvitePlayer(speaker, target);
-                    else SendChat(speaker.Name, "Player not found or ambiguous.");
-                    break;
-                case "!squadaccept":
-                    AcceptInvite(speaker);
-                    break;
-                case "!squadreject":
-                    RejectInvite(speaker);
-                    break;
-                case "!squadleave":
-                    LeaveSquad(speaker);
-                    break;
-                case "!squadkick":
-                    if (args.Length < 2) return;
-                    CustomPlayer kickTarget = FindPlayer(args[1]);
-                    if (kickTarget != null) KickPlayer(speaker, kickTarget);
-                    break;
-                case "!squadclose":
-                    CloseSquad(speaker);
-                    break;
-                case "!squadmembers":
-                    ShowSquadMembers(speaker);
-                    break;
-                case "!assist":
-                    ExecuteAssistCommand(speaker);
-                    break;
-                case "!playerscore":
+                case "!squadcreate": if (args.Length >= 2) CreateSquad(speaker, strMessage.Substring(args[0].Length).Trim()); break;
+                case "!squadinvite": if (args.Length >= 2) InvitePlayer(speaker, FindPlayer(args[1])); break;
+                case "!squadaccept": AcceptInvite(speaker); break;
+                case "!squadreject": RejectInvite(speaker); break;
+                case "!squadleave": LeaveSquad(speaker); break;
+                case "!squadkick": if (args.Length >= 2) KickPlayer(speaker, FindPlayer(args[1])); break;
+                case "!squadclose": CloseSquad(speaker); break;
+                case "!squadmembers": ShowSquadMembers(speaker); break;
+                case "!assist": ExecuteAssistCommand(speaker); break;
+                case "!stats":
                     if (args.Length >= 2)
                     {
                         string targetName = strMessage.Substring(args[0].Length).Trim();
@@ -408,18 +388,8 @@ namespace PRoConEvents
             {
                 CustomPlayer exact;
                 if (trackedPlayers.TryGetValue(searchName, out exact)) return exact;
-
-                List<CustomPlayer> matches = new List<CustomPlayer>();
-                foreach (KeyValuePair<string, CustomPlayer> kvp in trackedPlayers)
-                {
-                    if (kvp.Key.StartsWith(searchName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        matches.Add(kvp.Value);
-                    }
-                }
-
-                if (matches.Count == 1) return matches[0];
-                return null;
+                var matches = trackedPlayers.Where(kvp => kvp.Key.StartsWith(searchName, StringComparison.OrdinalIgnoreCase)).ToList();
+                return matches.Count == 1 ? matches[0].Value : null;
             }
         }
 
@@ -429,12 +399,12 @@ namespace PRoConEvents
             {
                 if (!string.IsNullOrEmpty(creator.CurrentSquadName))
                 {
-                    SendChat(creator.Name, "You are already in a squad. Type !squadleave to leave your squad.");
+                    SendChat(creator.Name, "You are already in a squad. Type !squadleave first.");
                     return;
                 }
                 if (activeSquads.ContainsKey(squadName))
                 {
-                    SendChat(creator.Name, squadName + " already taken, try another name.");
+                    SendChat(creator.Name, squadName + " already taken.");
                     return;
                 }
 
@@ -444,24 +414,23 @@ namespace PRoConEvents
                 creator.CurrentSquadName = squadName;
             }
 
-            SendChat(creator.Name, "You have created a squad named " + squadName + ". Invite with !squadinvite <name>.");
-            SendGlobalAnnouncement("Squad '" + squadName + "' has been created by " + creator.Name + "!");
+            SendChat(creator.Name, "Squad " + squadName + " created.");
+            SendGlobalAnnouncement("Squad '" + squadName + "' created by " + creator.Name + "!");
         }
 
         private void InvitePlayer(CustomPlayer inviter, CustomPlayer target)
         {
+            if (target == null) return;
             lock (stateLock)
             {
                 if (string.IsNullOrEmpty(inviter.CurrentSquadName) || !activeSquads.ContainsKey(inviter.CurrentSquadName)) return;
                 CustomSquad squad = activeSquads[inviter.CurrentSquadName];
-                if (squad.LeaderName != inviter.Name) return;
-                if (squad.Members.Count >= 5) { SendChat(inviter.Name, "Squad is full."); return; }
+                if (squad.LeaderName != inviter.Name || squad.Members.Count >= 5) return;
 
                 pendingInvites[target.Name] = new InviteInfo(squad.Name, DateTime.UtcNow.AddSeconds(inviteExpirySeconds));
             }
-
-            SendChat(inviter.Name, "You have invited " + target.Name + " to your squad.");
-            SendChat(target.Name, "You have been invited to " + inviter.CurrentSquadName + ". Type !squadaccept to join or !squadreject to reject. Invite expires in " + inviteExpirySeconds + "s.");
+            SendChat(inviter.Name, "Invite sent to " + target.Name);
+            SendChat(target.Name, "Invited to " + inviter.CurrentSquadName + ". Type !squadaccept or !squadreject.");
         }
 
         private void AcceptInvite(CustomPlayer player)
@@ -481,11 +450,7 @@ namespace PRoConEvents
                 {
                     activeSquads[squadName].Members.Add(player);
                     player.CurrentSquadName = squadName;
-                    SendChat(player.Name, "You have joined the squad " + squadName + ". Type !squadleave to leave.");
-                }
-                else
-                {
-                    SendChat(player.Name, "Squad no longer exists.");
+                    SendChat(player.Name, "Joined squad " + squadName);
                 }
             }
         }
@@ -494,10 +459,9 @@ namespace PRoConEvents
         {
             lock (stateLock)
             {
-                if (!pendingInvites.ContainsKey(player.Name)) { SendChat(player.Name, "No pending invite."); return; }
-                string squadName = pendingInvites[player.Name].SquadName;
+                if (!pendingInvites.ContainsKey(player.Name)) return;
                 pendingInvites.Remove(player.Name);
-                SendChat(player.Name, "You have rejected joining the squad " + squadName);
+                SendChat(player.Name, "Invite rejected.");
             }
         }
 
@@ -505,13 +469,11 @@ namespace PRoConEvents
         {
             lock (stateLock)
             {
-                if (string.IsNullOrEmpty(player.CurrentSquadName) || !activeSquads.ContainsKey(player.CurrentSquadName)) { SendChat(player.Name, "You are not in a squad."); return; }
-
+                if (string.IsNullOrEmpty(player.CurrentSquadName) || !activeSquads.ContainsKey(player.CurrentSquadName)) return;
                 string squadName = player.CurrentSquadName;
                 CustomSquad squad = activeSquads[squadName];
                 squad.Members.Remove(player);
                 player.CurrentSquadName = null;
-                SendChat(player.Name, "You have left the squad " + squadName);
 
                 if (squad.Members.Count == 0) activeSquads.Remove(squadName);
                 else if (squad.LeaderName == player.Name) squad.LeaderName = squad.Members[0].Name;
@@ -520,6 +482,7 @@ namespace PRoConEvents
 
         private void KickPlayer(CustomPlayer leader, CustomPlayer target)
         {
+            if (target == null) return;
             lock (stateLock)
             {
                 if (string.IsNullOrEmpty(leader.CurrentSquadName) || !activeSquads.ContainsKey(leader.CurrentSquadName)) return;
@@ -528,7 +491,6 @@ namespace PRoConEvents
 
                 squad.Members.Remove(target);
                 target.CurrentSquadName = null;
-                SendChat(leader.Name, target.Name + " has been kicked from " + squad.Name);
             }
         }
 
@@ -540,13 +502,8 @@ namespace PRoConEvents
                 CustomSquad squad = activeSquads[leader.CurrentSquadName];
                 if (squad.LeaderName != leader.Name) return;
 
-                string squadName = squad.Name;
-                for (int i = 0; i < squad.Members.Count; i++)
-                {
-                    squad.Members[i].CurrentSquadName = null;
-                    SendChat(squad.Members[i].Name, "Squad " + squadName + " has been closed");
-                }
-                activeSquads.Remove(squadName);
+                foreach (var m in squad.Members) m.CurrentSquadName = null;
+                activeSquads.Remove(squad.Name);
             }
         }
 
@@ -556,499 +513,10 @@ namespace PRoConEvents
             {
                 if (string.IsNullOrEmpty(player.CurrentSquadName) || !activeSquads.ContainsKey(player.CurrentSquadName))
                 {
-                    SendChat(player.Name, "You are not currently in a squad.");
+                    SendChat(player.Name, "You are not in a squad.");
                     return;
                 }
-
-                CustomSquad squad = activeSquads[player.CurrentSquadName];
-                string memberList = "";
-                for (int i = 0; i < squad.Members.Count; i++)
-                {
-                    memberList += squad.Members[i].Name;
-                    if (i < squad.Members.Count - 1) memberList += ", ";
-                }
-                SendChat(player.Name, "Squad " + squad.Name + " members: " + memberList);
-            }
-        }
-
-        private void ExecuteAssistCommand(CustomPlayer player)
-        {
-            lock (stateLock)
-            {
-                if (!isMatchRunning)
-                {
-                    SendChat(player.Name, "The !assist command is disabled during the end-of-round balancing phase.");
-                    return;
-                }
-            }
-
-            if (player.TeamId != 1 && player.TeamId != 2) return;
-
-            int team1Count = 0, team2Count = 0;
-            int team1Score = 0, team2Score = 0;
-
-            lock (stateLock)
-            {
-                foreach (KeyValuePair<string, CustomPlayer> kvp in trackedPlayers)
-                {
-                    if (kvp.Value.TeamId == 1)
-                    {
-                        team1Count++;
-                        team1Score += kvp.Value.CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
-                    }
-                    else if (kvp.Value.TeamId == 2)
-                    {
-                        team2Count++;
-                        team2Score += kvp.Value.CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
-                    }
-                }
-            }
-
-            int teamACount = (player.TeamId == 1) ? team1Count : team2Count;
-            int teamBCount = (player.TeamId == 1) ? team2Count : team1Count;
-            
-            int teamAScore = (player.TeamId == 1) ? team1Score : team2Score;
-            int teamBScore = (player.TeamId == 1) ? team2Score : team1Score;
-
-            bool element1 = teamACount <= teamBCount; 
-            bool element2 = teamBScore > teamAScore; 
-
-            if (element1 || element2)
-            {
-                SendGlobalAnnouncement("Can't assist " + player.Name + " to the other team it will cause unbalanced teams");
-            }
-            else
-            {
-                int newTeamId = (player.TeamId == 1) ? 2 : 1;
-                SafeExecuteCommand("procon.protected.send", "admin.movePlayer", player.Name, newTeamId.ToString(), "0", "true");
-                SendGlobalAnnouncement("Assisting " + player.Name + " to the other team. Thank you for assisting!");
-                
-                lock (stateLock) { player.TeamId = newTeamId; }
-
-                ThreadPool.QueueUserWorkItem(_ =>
-                {
-                    Thread.Sleep(1500); 
-                    List<CustomPlayer> newTeamPlayers = new List<CustomPlayer>();
-                    string currentMode;
-                    lock (stateLock)
-                    {
-                        currentMode = this.currentGameMode;
-                        foreach (var kvp in trackedPlayers)
-                        {
-                            if (kvp.Value.TeamId == newTeamId) newTeamPlayers.Add(kvp.Value);
-                        }
-                    }
-                    AssignInGameSquads(newTeamPlayers, newTeamId, currentMode);
-                });
-            }
-        }
-
-        // --- Core Balancing Hook with Persistent Heist Tracking ---
-        public override void OnRoundOver(int winningTeamId)
-        {
-            lock (stateLock) { isMatchRunning = false; }
-
-            bool isHeist = !string.IsNullOrEmpty(currentGameMode) && 
-                           currentGameMode.IndexOf("heist", StringComparison.OrdinalIgnoreCase) >= 0 &&
-                           currentGameMode.IndexOf("squad", StringComparison.OrdinalIgnoreCase) < 0;
-
-            if (isHeist)
-            {
-                int activeRound = 0;
-                lock (stateLock) { activeRound = persistentHeistRound; }
-
-                // If it's Round 1, save scores and skip balance
-                if (activeRound == 0)
-                {
-                    SendGlobalAnnouncement("Heist Round 1 complete. Scores saved. Teams will balance after Round 2.");
-                    
-                    List<CustomPlayer> lobbySnapshot;
-                    lock (stateLock) { lobbySnapshot = trackedPlayers.Values.Select(p => p.ShallowClone()).ToList(); }
-                    
-                    ThreadPool.QueueUserWorkItem(_ =>
-                    {
-                        try 
-                        {
-                            Thread.Sleep(Math.Max(0, balanceDelaySeconds) * 1000);
-                            RequestAllPlayerScores(lobbySnapshot);
-                            
-                            lock (stateLock) 
-                            {
-                                foreach (var p in lobbySnapshot) 
-                                {
-                                    if (matchProfiles.ContainsKey(p.Name)) 
-                                    {
-                                        int calc = matchProfiles[p.Name].CalculatedPlayerScore(scoreWeight, kdWeight, killWeight);
-                                        previousRoundScores[p.Name] = calc;
-                                    }
-                                }
-                                isMatchRunning = true; 
-                                matchProfiles.Clear();
-                            }
-                        }
-                        catch (Exception ex) { TryLogConsole("Round 1 save error: " + ex.Message); }
-                    });
-                    
-                    return; 
-                }
-                else
-                {
-                    SendGlobalAnnouncement("Heist Match over! Combining scores and balancing teams for the next map...");
-                }
-            }
-            else 
-            {
-                SendGlobalAnnouncement("Match over! Shuffling and balancing teams in " + balanceDelaySeconds + " seconds...");
-            }
-
-            List<CustomPlayer> finalLobbySnapshot;
-            List<CustomSquad> finalSquadsSnapshot;
-            lock (stateLock)
-            {
-                finalLobbySnapshot = trackedPlayers.Values.Select(p => p.ShallowClone()).ToList();
-                finalSquadsSnapshot = new List<CustomSquad>();
-                foreach (KeyValuePair<string, CustomSquad> kvp in activeSquads)
-                {
-                    CustomSquad copy = new CustomSquad();
-                    copy.Name = kvp.Value.Name;
-                    copy.LeaderName = kvp.Value.LeaderName;
-                    copy.Members = kvp.Value.Members.Select(m => m.ShallowClone()).ToList();
-                    finalSquadsSnapshot.Add(copy);
-                }
-            }
-
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                try
-                {
-                    Thread.Sleep(Math.Max(0, balanceDelaySeconds) * 1000);
-                    RequestAllPlayerScores(finalLobbySnapshot);
-                    RunBalancer(finalLobbySnapshot, finalSquadsSnapshot);
-
-                    lock (stateLock)
-                    {
-                        matchProfiles.Clear();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    TryLogConsole("Balancer thread error: " + ex.Message);
-                }
-            });
-        }
-
-        private void RequestAllPlayerScores(List<CustomPlayer> lobbySnapshot)
-        {
-            if (lobbySnapshot == null || lobbySnapshot.Count == 0) return;
-
-            lock (pendingScoreRequests)
-            {
-                pendingScoreRequests.Clear();
-                foreach (var p in lobbySnapshot)
-                {
-                    if (!pendingScoreRequests.ContainsKey(p.Name))
-                    {
-                        pendingScoreRequests[p.Name] = new ManualResetEventSlim(false);
-                    }
-                }
-            }
-
-            foreach (var p in lobbySnapshot)
-            {
-                SafeExecuteCommand("procon.protected.send", "server.getPlayerStats", p.Name);
-            }
-
-            int timeout = Math.Max(0, scoreRequestTimeoutMs);
-            DateTime waitStart = DateTime.UtcNow;
-            foreach (var kvp in pendingScoreRequests.ToList())
-            {
-                var ev = kvp.Value;
-                int elapsed = (int)(DateTime.UtcNow - waitStart).TotalMilliseconds;
-                int remaining = Math.Max(0, timeout - elapsed);
-                if (remaining <= 0) break;
-                try { ev.Wait(remaining); } catch { }
-            }
-
-            lock (pendingScoreRequests)
-            {
-                foreach (var ev in pendingScoreRequests.Values) { try { ev.Dispose(); } catch { } }
-                pendingScoreRequests.Clear();
-            }
-        }
-
-        private void RunBalancer(List<CustomPlayer> lobbySnapshot, List<CustomSquad> squadsSnapshot)
-        {
-            try
-            {
-                string currentMode = "";
-                lock (stateLock)
-                {
-                    currentMode = this.currentGameMode;
-                    
-                    for (int i = 0; i < lobbySnapshot.Count; i++)
-                    {
-                        var snap = lobbySnapshot[i];
-                        if (matchProfiles.ContainsKey(snap.Name))
-                        {
-                            var live = matchProfiles[snap.Name];
-                            snap.OverallScore = live.OverallScore;
-                            snap.Kills = live.Kills;
-                            snap.Deaths = live.Deaths;
-                        }
-                        if (previousRoundScores.ContainsKey(snap.Name))
-                        {
-                            snap.PreviousRoundCalculatedScore = previousRoundScores[snap.Name];
-                        }
-                    }
-
-                    foreach (var s in squadsSnapshot)
-                    {
-                        for (int m = 0; m < s.Members.Count; m++)
-                        {
-                            var mem = s.Members[m];
-                            if (matchProfiles.ContainsKey(mem.Name))
-                            {
-                                var live = matchProfiles[mem.Name];
-                                mem.OverallScore = live.OverallScore;
-                                mem.Kills = live.Kills;
-                                mem.Deaths = live.Deaths;
-                            }
-                            if (previousRoundScores.ContainsKey(mem.Name))
-                            {
-                                mem.PreviousRoundCalculatedScore = previousRoundScores[mem.Name];
-                            }
-                        }
-                    }
-                }
-
-                if (lobbySnapshot == null || lobbySnapshot.Count == 0) return;
-
-                int hardLimit = (int)Math.Floor(lobbySnapshot.Count / 2.0);
-
-                List<BalanceGroup> groups = new List<BalanceGroup>();
-                HashSet<string> groupedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-                if (preserveSquads)
-                {
-                    for (int sIndex = 0; sIndex < squadsSnapshot.Count; sIndex++)
-                    {
-                        CustomSquad s = squadsSnapshot[sIndex];
-                        if (s.Members != null && s.Members.Count > 0)
-                        {
-                            BalanceGroup bg = new BalanceGroup();
-                            for (int mIndex = 0; mIndex < s.Members.Count; mIndex++)
-                            {
-                                bg.Players.Add(s.Members[mIndex]);
-                                groupedNames.Add(s.Members[mIndex].Name);
-                            }
-                            groups.Add(bg);
-                        }
-                    }
-                }
-
-                for (int pIndex = 0; pIndex < lobbySnapshot.Count; pIndex++)
-                {
-                    CustomPlayer p = lobbySnapshot[pIndex];
-                    if (!groupedNames.Contains(p.Name))
-                    {
-                        BalanceGroup bg = new BalanceGroup();
-                        bg.Players.Add(p);
-                        groups.Add(bg);
-                    }
-                }
-
-                groups = groups.OrderByDescending(g => g.Size).ThenBy(g => randomGen.Next()).ToList();
-
-                List<BalanceGroup> teamAGroups = new List<BalanceGroup>();
-                List<BalanceGroup> teamBGroups = new List<BalanceGroup>();
-                int playersA = 0, playersB = 0;
-                int scoreA = 0, scoreB = 0;
-
-                for (int gIndex = 0; gIndex < groups.Count; gIndex++)
-                {
-                    BalanceGroup g = groups[gIndex];
-                    int gSize = g.Size;
-                    int gScore = g.TotalScore(scoreWeight, kdWeight, killWeight);
-
-                    bool canA = (playersA + gSize <= hardLimit);
-                    bool canB = (playersB + gSize <= hardLimit);
-
-                    if (canA && canB)
-                    {
-                        if (playersA < playersB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
-                        else if (playersB < playersA) { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
-                        else
-                        {
-                            if (scoreA <= scoreB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
-                            else { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
-                        }
-                    }
-                    else if (canA)
-                    {
-                        teamAGroups.Add(g); playersA += gSize; scoreA += gScore;
-                    }
-                    else if (canB)
-                    {
-                        teamBGroups.Add(g); playersB += gSize; scoreB += gScore;
-                    }
-                    else
-                    {
-                        if (playersA <= playersB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
-                        else { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
-                    }
-                }
-
-                bool improved = true;
-                int iterations = 0;
-                while (improved && iterations < 100)
-                {
-                    improved = false;
-                    iterations++;
-                    int currentDiff = Math.Abs(scoreA - scoreB);
-
-                    for (int i = 0; i < teamAGroups.Count; i++)
-                    {
-                        for (int j = 0; j < teamBGroups.Count; j++)
-                        {
-                            BalanceGroup a = teamAGroups[i];
-                            BalanceGroup b = teamBGroups[j];
-
-                            if (a.Size != b.Size) continue;
-
-                            int newScoreA = scoreA - a.TotalScore(scoreWeight, kdWeight, killWeight) + b.TotalScore(scoreWeight, kdWeight, killWeight);
-                            int newScoreB = scoreB - b.TotalScore(scoreWeight, kdWeight, killWeight) + a.TotalScore(scoreWeight, kdWeight, killWeight);
-                            int newDiff = Math.Abs(newScoreA - newScoreB);
-
-                            if (newDiff < currentDiff)
-                            {
-                                teamAGroups[i] = b;
-                                teamBGroups[j] = a;
-                                scoreA = newScoreA;
-                                scoreB = newScoreB;
-                                improved = true;
-                                goto NextSwapPass;
-                            }
-                        }
-                    }
-                NextSwapPass:
-                    continue;
-                }
-
-                List<CustomPlayer> finalTeamA = new List<CustomPlayer>();
-                for (int i = 0; i < teamAGroups.Count; i++)
-                {
-                    finalTeamA.AddRange(teamAGroups[i].Players);
-                    for (int j = 0; j < teamAGroups[i].Players.Count; j++)
-                    {
-                        lock (stateLock) { if (trackedPlayers.ContainsKey(teamAGroups[i].Players[j].Name)) trackedPlayers[teamAGroups[i].Players[j].Name].TeamId = 1; }
-                    }
-                }
-
-                List<CustomPlayer> finalTeamB = new List<CustomPlayer>();
-                for (int i = 0; i < teamBGroups.Count; i++)
-                {
-                    finalTeamB.AddRange(teamBGroups[i].Players);
-                    for (int j = 0; j < teamBGroups[i].Players.Count; j++)
-                    {
-                        lock (stateLock) { if (trackedPlayers.ContainsKey(teamBGroups[i].Players[j].Name)) trackedPlayers[teamBGroups[i].Players[j].Name].TeamId = 2; }
-                    }
-                }
-
-                AssignInGameSquads(finalTeamA, 1, currentMode);
-                AssignInGameSquads(finalTeamB, 2, currentMode);
-
-                SendGlobalAnnouncement("Teams balanced! Final Player Counts - Team A: " + playersA + " | Team B: " + playersB + " | Scores - Team A: " + scoreA + " | Team B: " + scoreB);
-
-                lock (stateLock)
-                {
-                    foreach (KeyValuePair<string, CustomPlayer> kvp in trackedPlayers)
-                    {
-                        kvp.Value.OverallScore = 0;
-                        kvp.Value.Kills = 0;
-                        kvp.Value.Deaths = 0;
-                    }
-                    
-                    previousRoundScores.Clear(); 
-                    isMatchRunning = true; 
-                }
-            }
-            catch (Exception ex)
-            {
-                TryLogConsole("RunBalancer error: " + ex.Message);
-            }
-        }
-
-        private void AssignInGameSquads(List<CustomPlayer> teamPlayers, int teamId, string mode)
-        {
-            if (string.IsNullOrEmpty(mode)) mode = "";
-            string m = mode.ToLower();
-            
-            bool is5v5 = m.Contains("rescue") || m.Contains("crosshair") || m.Contains("squadheist");
-
-            if (is5v5)
-            {
-                foreach(var p in teamPlayers) 
-                {
-                    SafeExecuteCommand("procon.protected.send", "admin.movePlayer", p.Name, teamId.ToString(), "1", "true");
-                }
-                return;
-            }
-
-            var squads = new Dictionary<string, List<CustomPlayer>>(StringComparer.OrdinalIgnoreCase);
-            var solos = new List<CustomPlayer>();
-
-            foreach(var p in teamPlayers) 
-            {
-                if (!string.IsNullOrEmpty(p.CurrentSquadName)) 
-                {
-                    if (!squads.ContainsKey(p.CurrentSquadName)) squads[p.CurrentSquadName] = new List<CustomPlayer>();
-                    squads[p.CurrentSquadName].Add(p);
-                } 
-                else 
-                {
-                    solos.Add(p);
-                }
-            }
-
-            int currentSquadId = 1;
-
-            foreach(var kvp in squads) 
-            {
-                var squadMembers = kvp.Value;
-                int currentSquadCount = 0;
-
-                foreach(var p in squadMembers) 
-                {
-                    if (currentSquadCount >= 5) 
-                    {
-                        currentSquadId++;
-                        currentSquadCount = 0;
-                    }
-                    SafeExecuteCommand("procon.protected.send", "admin.movePlayer", p.Name, teamId.ToString(), currentSquadId.ToString(), "true");
-                    currentSquadCount++;
-                }
-                
-                while (currentSquadCount < 5 && solos.Count > 0) 
-                {
-                    var soloPlayer = solos[0];
-                    solos.RemoveAt(0);
-                    SafeExecuteCommand("procon.protected.send", "admin.movePlayer", soloPlayer.Name, teamId.ToString(), currentSquadId.ToString(), "true");
-                    currentSquadCount++;
-                }
-                
-                currentSquadId++;
-            }
-
-            int soloCount = 0;
-            foreach(var p in solos) 
-            {
-                if (soloCount >= 5) 
-                {
-                    currentSquadId++;
-                    soloCount = 0;
-                }
-                SafeExecuteCommand("procon.protected.send", "admin.movePlayer", p.Name, teamId.ToString(), currentSquadId.ToString(), "true");
-                soloCount++;
+                SendChat(player.Name, "Squad Members: " + string.Join(", ", activeSquads[player.CurrentSquadName].Members.Select(m => m.Name)));
             }
         }
 
@@ -1091,55 +559,307 @@ namespace PRoConEvents
             SendChat(requester.Name, overallLine);
         }
 
-        private void SendChat(string playerName, string msg)
+        private void ExecuteAssistCommand(CustomPlayer player)
         {
-            SafeExecuteCommand("procon.protected.send", "admin.say", msg, "player", playerName);
+            lock (stateLock)
+            {
+                if (!isMatchRunning || (DateTime.UtcNow - matchStartTime).TotalMinutes < assistEnableDelayMinutes)
+                {
+                    SendChat(player.Name, "Can't assist you to other team it will cause unbalanced teams !");
+                    return; 
+                }
+            }
+
+            if (player.TeamId != 1 && player.TeamId != 2) return;
+
+            lock (stateLock)
+            {
+                int newTeamId = (player.TeamId == 1) ? 2 : 1;
+                authorizedTeams[player.Name] = newTeamId; 
+                SafeExecuteCommand("procon.protected.send", "admin.movePlayer", player.Name, newTeamId.ToString(), "0", "true");
+                SendChat(player.Name, "Assisting you to other team thank you for assisting !");
+                player.TeamId = newTeamId;
+            }
         }
 
-        private void SendGlobalAnnouncement(string msg)
+        public override void OnRoundOver(int winningTeamId)
         {
-            SafeExecuteCommand("procon.protected.send", "admin.say", msg, "all");
+            lock (stateLock) { isMatchRunning = false; }
+
+            bool isTwoRoundMode = !string.IsNullOrEmpty(currentGameMode) && 
+                                  currentGameMode.IndexOf("heist", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (isTwoRoundMode)
+            {
+                lock (stateLock) { heistRoundCount++; }
+                if (heistRoundCount == 1)
+                {
+                    // REMOVED message here to keep chat clean between Heist rounds
+                    isMatchRunning = true;
+                    return; 
+                }
+                else { lock (stateLock) { heistRoundCount = 0; } }
+            }
+
+            lock (stateLock)
+            {
+                pendingMapChangeLobbySnapshot = trackedPlayers.Values.Select(p => p.ShallowClone()).ToList();
+                pendingMapChangeSquadsSnapshot = new List<CustomSquad>();
+                foreach (var kvp in activeSquads)
+                {
+                    CustomSquad copy = new CustomSquad { Name = kvp.Value.Name, LeaderName = kvp.Value.LeaderName };
+                    copy.Members = kvp.Value.Members.Select(m => m.ShallowClone()).ToList();
+                    pendingMapChangeSquadsSnapshot.Add(copy);
+                }
+            }
+            
+            ThreadPool.QueueUserWorkItem(_ => RequestAllPlayerScores(pendingMapChangeLobbySnapshot));
         }
 
-        private void SafeExecuteCommand(string service)
+        private void RequestAllPlayerScores(List<CustomPlayer> lobbySnapshot)
         {
-            try { this.ExecuteCommand(service); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
+            if (lobbySnapshot == null || lobbySnapshot.Count == 0) return;
+            lock (pendingScoreRequests)
+            {
+                pendingScoreRequests.Clear();
+                foreach (var p in lobbySnapshot) pendingScoreRequests[p.Name] = new ManualResetEventSlim(false);
+            }
+            foreach (var p in lobbySnapshot) SafeExecuteCommand("procon.protected.send", "server.getPlayerStats", p.Name);
         }
 
-        private void SafeExecuteCommand(string service, string a1)
+        private void RunBalancer(List<CustomPlayer> lobbySnapshot, List<CustomSquad> squadsSnapshot)
         {
-            try { this.ExecuteCommand(service, a1); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
+            try
+            {
+                string currentMode = "";
+                lock (stateLock)
+                {
+                    currentMode = this.currentGameMode;
+                    foreach (var snap in lobbySnapshot)
+                    {
+                        if (matchProfiles.ContainsKey(snap.Name))
+                        {
+                            var live = matchProfiles[snap.Name];
+                            snap.OverallScore = live.OverallScore;
+                            snap.Kills = live.Kills;
+                            snap.Deaths = live.Deaths;
+                        }
+                        if (previousRoundScores.ContainsKey(snap.Name)) snap.PreviousRoundCalculatedScore = previousRoundScores[snap.Name];
+                    }
+                }
+
+                if (lobbySnapshot == null || lobbySnapshot.Count == 0) return;
+
+                HashSet<string> groupedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                List<BalanceGroup> groups = new List<BalanceGroup>();
+
+                if (preserveSquads)
+                {
+                    foreach (var s in squadsSnapshot)
+                    {
+                        BalanceGroup bg = new BalanceGroup();
+                        foreach (var m in s.Members)
+                        {
+                            var playerMatch = lobbySnapshot.FirstOrDefault(lp => lp.Name == m.Name);
+                            if (playerMatch != null)
+                            {
+                                bg.Players.Add(playerMatch);
+                                groupedNames.Add(playerMatch.Name);
+                            }
+                        }
+                        if (bg.Size > 0) groups.Add(bg);
+                    }
+                }
+
+                foreach (var p in lobbySnapshot)
+                {
+                    if (!groupedNames.Contains(p.Name))
+                    {
+                        BalanceGroup bg = new BalanceGroup();
+                        bg.Players.Add(p);
+                        groups.Add(bg);
+                    }
+                }
+
+                groups = groups.OrderByDescending(g => g.Size).ThenBy(g => randomGen.Next()).ToList();
+
+                int totalPlayers = lobbySnapshot.Count;
+                int maxTeamSize = (int)Math.Ceiling(totalPlayers / 2.0);
+
+                int playersA = 0, playersB = 0;
+                int scoreA = 0, scoreB = 0;
+                List<BalanceGroup> teamAGroups = new List<BalanceGroup>();
+                List<BalanceGroup> teamBGroups = new List<BalanceGroup>();
+
+                // Phase 1: Initial Greedy Draft Allocation
+                foreach (var g in groups)
+                {
+                    int gSize = g.Size;
+                    int gScore = g.TotalScore(scoreWeight, kdWeight, killWeight);
+
+                    bool canFitA = (playersA + gSize <= maxTeamSize);
+                    bool canFitB = (playersB + gSize <= maxTeamSize);
+
+                    if (canFitA && canFitB)
+                    {
+                        if (playersA < playersB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
+                        else if (playersB < playersA) { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
+                        else
+                        {
+                            if (scoreA <= scoreB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
+                            else { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
+                        }
+                    }
+                    else if (canFitA) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
+                    else if (canFitB) { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
+                    else
+                    {
+                        if (playersA <= playersB) { teamAGroups.Add(g); playersA += gSize; scoreA += gScore; }
+                        else { teamBGroups.Add(g); playersB += gSize; scoreB += gScore; }
+                    }
+                }
+
+                // Phase 2: Post-Processing Optimization (Solo Player Swapping)
+                bool improved = true;
+                while (improved)
+                {
+                    improved = false;
+                    int currentDiff = Math.Abs(scoreA - scoreB);
+                    BalanceGroup bestGA = null;
+                    BalanceGroup bestGB = null;
+                    int bestNewDiff = currentDiff;
+
+                    var soloA = teamAGroups.Where(g => g.Size == 1).ToList();
+                    var soloB = teamBGroups.Where(g => g.Size == 1).ToList();
+
+                    foreach (var gA in soloA)
+                    {
+                        foreach (var gB in soloB)
+                        {
+                            int scoreGA = gA.TotalScore(scoreWeight, kdWeight, killWeight);
+                            int scoreGB = gB.TotalScore(scoreWeight, kdWeight, killWeight);
+
+                            int newScoreA = scoreA - scoreGA + scoreGB;
+                            int newScoreB = scoreB - scoreGB + scoreGA;
+                            int newDiff = Math.Abs(newScoreA - newScoreB);
+
+                            if (newDiff < bestNewDiff)
+                            {
+                                bestNewDiff = newDiff;
+                                bestGA = gA;
+                                bestGB = gB;
+                            }
+                        }
+                    }
+
+                    if (bestGA != null && bestGB != null && bestNewDiff < currentDiff)
+                    {
+                        int sA = bestGA.TotalScore(scoreWeight, kdWeight, killWeight);
+                        int sB = bestGB.TotalScore(scoreWeight, kdWeight, killWeight);
+
+                        teamAGroups.Remove(bestGA);
+                        teamBGroups.Add(bestGA);
+
+                        teamBGroups.Remove(bestGB);
+                        teamAGroups.Add(bestGB);
+
+                        scoreA = scoreA - sA + sB;
+                        scoreB = scoreB - sB + sA;
+                        improved = true;
+                    }
+                }
+
+                List<CustomPlayer> finalTeamA = new List<CustomPlayer>();
+                List<CustomPlayer> finalTeamB = new List<CustomPlayer>();
+
+                foreach (var g in teamAGroups) finalTeamA.AddRange(g.Players);
+                foreach (var g in teamBGroups) finalTeamB.AddRange(g.Players);
+
+                lock (stateLock)
+                {
+                    authorizedTeams.Clear();
+                    foreach (var p in finalTeamA) authorizedTeams[p.Name] = 1;
+                    foreach (var p in finalTeamB) authorizedTeams[p.Name] = 2;
+                }
+
+                AssignInGameSquads(finalTeamA, 1, currentMode);
+                AssignInGameSquads(finalTeamB, 2, currentMode);
+
+                // --- NEW CHAT ANNOUNCEMENTS ---
+                SendGlobalAnnouncement("Match over balancing teams:");
+                SendGlobalAnnouncement("Team A team playerscore: " + scoreA);
+                SendGlobalAnnouncement("Team B team playerscore: " + scoreB);
+
+                // --- NEW CONSOLE LOGGING ---
+                TryLogConsole("Teams successfully balanced!");
+                TryLogConsole("Team A PlayerScore: " + scoreA + " | Total Players: " + playersA);
+                TryLogConsole("Team B PlayerScore: " + scoreB + " | Total Players: " + playersB);
+
+                lock (stateLock) { isMatchRunning = true; }
+            }
+            catch (Exception ex) { TryLogConsole("RunBalancer error: " + ex.Message); }
         }
 
-        private void SafeExecuteCommand(string service, string a1, string a2)
+        private void AssignInGameSquads(List<CustomPlayer> teamPlayers, int teamId, string mode)
         {
-            try { this.ExecuteCommand(service, a1, a2); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
+            if (string.IsNullOrEmpty(mode)) mode = "";
+            bool is5v5 = mode.ToLower().Contains("rescue") || mode.ToLower().Contains("crosshair");
+
+            int squadId = 1;
+            int countInSquad = 0;
+
+            foreach (var p in teamPlayers)
+            {
+                if (is5v5)
+                {
+                    SafeExecuteCommand("procon.protected.send", "admin.movePlayer", p.Name, teamId.ToString(), "1", "true");
+                }
+                else
+                {
+                    if (countInSquad >= 5)
+                    {
+                        squadId++;
+                        countInSquad = 0;
+                    }
+                    SafeExecuteCommand("procon.protected.send", "admin.movePlayer", p.Name, teamId.ToString(), squadId.ToString(), "true");
+                    countInSquad++;
+                }
+            }
         }
 
-        private void SafeExecuteCommand(string service, string a1, string a2, string a3)
-        {
-            try { this.ExecuteCommand(service, a1, a2, a3); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
-        }
+        private void SendChat(string playerName, string msg) { SafeExecuteCommand("procon.protected.send", "admin.say", msg, "player", playerName); }
+        private void SendGlobalAnnouncement(string msg) { SafeExecuteCommand("procon.protected.send", "admin.say", msg, "all"); }
 
-        private void SafeExecuteCommand(string service, string a1, string a2, string a3, string a4)
-        {
-            try { this.ExecuteCommand(service, a1, a2, a3, a4); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
+        // --- Execute Command Overloads ---
+        private void SafeExecuteCommand(string service) 
+        { 
+            try { this.ExecuteCommand(service); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
         }
-
-        private void SafeExecuteCommand(string service, string a1, string a2, string a3, string a4, string a5)
-        {
-            try { this.ExecuteCommand(service, a1, a2, a3, a4, a5); }
-            catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); }
+        private void SafeExecuteCommand(string service, string a1) 
+        { 
+            try { this.ExecuteCommand(service, a1); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
         }
-
-        private void TryLogConsole(string message)
-        {
-            try { this.ExecuteCommand("procon.protected.plugin.console", message); } catch { }
+        private void SafeExecuteCommand(string service, string a1, string a2) 
+        { 
+            try { this.ExecuteCommand(service, a1, a2); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
         }
+        private void SafeExecuteCommand(string service, string a1, string a2, string a3) 
+        { 
+            try { this.ExecuteCommand(service, a1, a2, a3); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
+        }
+        private void SafeExecuteCommand(string service, string a1, string a2, string a3, string a4) 
+        { 
+            try { this.ExecuteCommand(service, a1, a2, a3, a4); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
+        }
+        private void SafeExecuteCommand(string service, string a1, string a2, string a3, string a4, string a5) 
+        { 
+            try { this.ExecuteCommand(service, a1, a2, a3, a4, a5); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
+        }
+        private void SafeExecuteCommand(string service, string a1, string a2, string a3, string a4, string a5, string a6) 
+        { 
+            try { this.ExecuteCommand(service, a1, a2, a3, a4, a5, a6); } catch (Exception ex) { TryLogConsole("SquadAutoBalancer Error: " + ex.Message); } 
+        }
+        
+        private void TryLogConsole(string message) { try { this.ExecuteCommand("procon.protected.plugin.console", message); } catch { } }
     }
 }
