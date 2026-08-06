@@ -176,7 +176,7 @@ namespace PRoConEvents
                 "OnServerInfo", "OnLevelLoaded");
         }
 
-        public void OnPluginEnable() { SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Balancer 2.0.2 Enabled!"); }
+        public void OnPluginEnable() { SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Balancer 2.0.0 Enabled!"); }
         public void OnPluginDisable() { }
 
         public override void OnServerInfo(CServerInfo serverInfo)
@@ -712,7 +712,7 @@ namespace PRoConEvents
                 int newTeamId = (player.TeamId == 1) ? 2 : 1;
                 authorizedTeams[player.Name] = newTeamId; 
                 SafeExecuteCommand("procon.protected.send", "admin.movePlayer", player.Name, newTeamId.ToString(), "0", "true");
-                SendChat(player.Name, "Assisting you to other team thank you for assisting !");
+                SendChat(player.Name, "Switching you to the other team thank you for assisting !");
                 player.TeamId = newTeamId;
             }
         }
@@ -788,7 +788,11 @@ namespace PRoConEvents
                     scoreBBefore = lobbySnapshot.Where(p => p.TeamId == 2).Sum(p => p.CalculatedPlayerScore(scoreWeight, kdWeight, killWeight));
                 }
 
-                if (lobbySnapshot == null || lobbySnapshot.Count == 0) return;
+                if (lobbySnapshot == null || lobbySnapshot.Count <= 4)
+                {
+                    lock (stateLock) { isMatchRunning = true; }
+                    return;
+                }
 
                 HashSet<string> groupedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 List<BalanceGroup> groups = new List<BalanceGroup>();
