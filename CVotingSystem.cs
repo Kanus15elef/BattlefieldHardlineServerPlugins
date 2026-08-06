@@ -340,7 +340,7 @@ namespace PRoConEvents
                         catch { }
 
                         ResetVotingState(true);
-                        SendGlobalChat("all voting stages has been deleted and clear due to low player count");
+                        SendGlobalChat("Postponing and clearing all voting phase waiting for player threshold to reach  to start the voting again !");
                     }
 
                     if (!isWaitingForPlayers)
@@ -373,6 +373,9 @@ namespace PRoConEvents
                         catch { }
 
                         ResetVotingState(true);
+
+                        SendGlobalChat("Match is starting clearing all voting and maps from the map list");
+                        SendGlobalChat("Starting voting count down for the upcoming match !");
 
                         double delayMs = mapVotingStartDelaySeconds * 1000.0;
                         if (delayMs <= 0) delayMs = 1000.0;
@@ -1108,6 +1111,10 @@ namespace PRoConEvents
                                 LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} changed map vote from {oldMap} to {chosenMap}");
                                 SendGlobalChat($"{strSpeaker} has changed its voting from {oldMap} to {chosenMap} !");
                             }
+                            else
+                            {
+                                SendPlayerChat(strSpeaker, $"You have already voted for the map {chosenMap} !");
+                            }
                         }
                         else
                         {
@@ -1135,6 +1142,10 @@ namespace PRoConEvents
                                 playerCurrentGamemodeVote[strSpeaker] = chosenMode;
                                 LogLive($"[CVotingSystem] [Live]: Player {strSpeaker} changed mode vote from {oldMode} to {chosenMode}");
                                 SendGlobalChat($"{strSpeaker} has changed its voting from the map {winningMap} [{oldMode}] to the map {winningMap} [{chosenMode}] !");
+                            }
+                            else
+                            {
+                                SendPlayerChat(strSpeaker, $"You have already voted for the mode {chosenMode} !");
                             }
                         }
                         else
