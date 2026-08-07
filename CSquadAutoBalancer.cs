@@ -176,7 +176,7 @@ namespace PRoConEvents
                 "OnServerInfo", "OnLevelLoaded");
         }
 
-        public void OnPluginEnable() { SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Balancer 2.0.0 Enabled!"); }
+        public void OnPluginEnable() { SafeExecuteCommand("procon.protected.plugin.console", "Squad Auto Balancer 2.0.2 Enabled!"); }
         public void OnPluginDisable() { }
 
         public override void OnServerInfo(CServerInfo serverInfo)
