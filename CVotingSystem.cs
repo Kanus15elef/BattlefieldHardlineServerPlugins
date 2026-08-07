@@ -232,7 +232,7 @@ namespace PRoConEvents
 
         public void OnPluginEnable()
         {
-            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v2.0.3 Enabled!");
+            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v2.0.0 Enabled!");
             ResetVotingState(true);
             currentPlayerCount = 0;
             isWaitingForPlayers = false;
