@@ -102,6 +102,13 @@ namespace PRoConEvents
             }
         }
 
+        public class CumulativePlayerStats
+        {
+            public int Score { get; set; }
+            public int Kills { get; set; }
+            public int Deaths { get; set; }
+        }
+
         public class CustomSquad
         {
             public string Name { get; set; }
@@ -150,6 +157,7 @@ namespace PRoConEvents
         private readonly Dictionary<string, InviteInfo> pendingInvites = new Dictionary<string, InviteInfo>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, DateTime> rejectCooldowns = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CustomPlayer> matchProfiles = new Dictionary<string, CustomPlayer>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CumulativePlayerStats> matchCumulativeStats = new Dictionary<string, CumulativePlayerStats>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, ManualResetEventSlim> pendingScoreRequests = new Dictionary<string, ManualResetEventSlim>(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, int> authorizedTeams = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
@@ -161,8 +169,13 @@ namespace PRoConEvents
         private int heistRoundCount = 0;
         private Dictionary<string, int> previousRoundScores = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
         
-        private List<CustomPlayer> pendingMapChangeLobbySnapshot = null;
-        private List<CustomSquad> pendingMapChangeSquadsSnapshot = null;
+        // Pre-calculated team storage for map transition
+        private List<CustomPlayer> precalculatedTeamA = null;
+        private List<CustomPlayer> precalculatedTeamB = null;
+        private int precalculatedScoreABefore = 0;
+        private int precalculatedScoreBBefore = 0;
+        private int precalculatedScoreAAfter = 0;
+        private int precalculatedScoreBAfter = 0;
 
         private DateTime matchStartTime = DateTime.UtcNow;
 
@@ -195,28 +208,20 @@ namespace PRoConEvents
                 this.heistRoundCount = roundsPlayed; 
                 this.previousRoundScores.Clear();
                 this.authorizedTeams.Clear(); 
+                this.matchCumulativeStats.Clear();
                 this.matchStartTime = DateTime.UtcNow;
             }
 
-            if (pendingMapChangeLobbySnapshot != null && pendingMapChangeSquadsSnapshot != null)
+            ThreadPool.QueueUserWorkItem(_ =>
             {
-                List<CustomPlayer> lobby = pendingMapChangeLobbySnapshot;
-                List<CustomSquad> squads = pendingMapChangeSquadsSnapshot;
-                
-                pendingMapChangeLobbySnapshot = null;
-                pendingMapChangeSquadsSnapshot = null;
-
-                ThreadPool.QueueUserWorkItem(_ =>
+                try
                 {
-                    try
-                    {
-                        Thread.Sleep(2000); 
-                        RunBalancer(lobby, squads);
-                        lock (stateLock) { matchProfiles.Clear(); }
-                    }
-                    catch (Exception ex) { TryLogConsole("OnLevelLoaded Balancer error: " + ex.Message); }
-                });
-            }
+                    Thread.Sleep(2000); 
+                    ExecutePrecalculatedTeams(GameMode);
+                    lock (stateLock) { matchProfiles.Clear(); }
+                }
+                catch (Exception ex) { TryLogConsole("OnLevelLoaded Balancer error: " + ex.Message); }
+            });
         }
 
         public override void OnPlayerJoin(string strSoldierName)
@@ -726,28 +731,61 @@ namespace PRoConEvents
 
             if (isTwoRoundMode)
             {
-                lock (stateLock) { heistRoundCount++; }
-                if (heistRoundCount == 1)
-                {
-                    isMatchRunning = true;
-                    return; 
+                lock (stateLock) 
+                { 
+                    // Accumulate current round stats into match cumulative storage
+                    foreach (var kvp in trackedPlayers)
+                    {
+                        string name = kvp.Key;
+                        int score = kvp.Value.OverallScore;
+                        int kills = kvp.Value.Kills;
+                        int deaths = kvp.Value.Deaths;
+
+                        if (matchProfiles.ContainsKey(name))
+                        {
+                            score = matchProfiles[name].OverallScore;
+                            kills = matchProfiles[name].Kills;
+                            deaths = matchProfiles[name].Deaths;
+                        }
+
+                        if (!matchCumulativeStats.ContainsKey(name))
+                        {
+                            matchCumulativeStats[name] = new CumulativePlayerStats();
+                        }
+                        matchCumulativeStats[name].Score += score;
+                        matchCumulativeStats[name].Kills += kills;
+                        matchCumulativeStats[name].Deaths += deaths;
+                    }
+
+                    heistRoundCount++; 
+                    if (heistRoundCount == 1)
+                    {
+                        isMatchRunning = true;
+                        return; // Round 1 done, wait for Round 2
+                    }
+                    else 
+                    { 
+                        heistRoundCount = 0; // Round 2 done, proceed to balance with accumulated stats!
+                    }
                 }
-                else { lock (stateLock) { heistRoundCount = 0; } }
             }
+
+            List<CustomPlayer> lobbySnapshot;
+            List<CustomSquad> squadsSnapshot;
 
             lock (stateLock)
             {
-                pendingMapChangeLobbySnapshot = trackedPlayers.Values.Select(p => p.ShallowClone()).ToList();
-                pendingMapChangeSquadsSnapshot = new List<CustomSquad>();
+                lobbySnapshot = trackedPlayers.Values.Select(p => p.ShallowClone()).ToList();
+                squadsSnapshot = new List<CustomSquad>();
                 foreach (var kvp in activeSquads)
                 {
                     CustomSquad copy = new CustomSquad { Name = kvp.Value.Name, LeaderName = kvp.Value.LeaderName };
                     copy.Members = kvp.Value.Members.Select(m => m.ShallowClone()).ToList();
-                    pendingMapChangeSquadsSnapshot.Add(copy);
+                    squadsSnapshot.Add(copy);
                 }
             }
             
-            ThreadPool.QueueUserWorkItem(_ => RequestAllPlayerScores(pendingMapChangeLobbySnapshot));
+            ThreadPool.QueueUserWorkItem(_ => CalculateBalancedTeams(lobbySnapshot, squadsSnapshot, isTwoRoundMode));
         }
 
         private void RequestAllPlayerScores(List<CustomPlayer> lobbySnapshot)
@@ -761,20 +799,24 @@ namespace PRoConEvents
             foreach (var p in lobbySnapshot) SafeExecuteCommand("procon.protected.send", "server.getPlayerStats", p.Name);
         }
 
-        private void RunBalancer(List<CustomPlayer> lobbySnapshot, List<CustomSquad> squadsSnapshot)
+        private void CalculateBalancedTeams(List<CustomPlayer> lobbySnapshot, List<CustomSquad> squadsSnapshot, bool isTwoRoundMode)
         {
             try
             {
-                string currentMode = "";
                 int scoreABefore = 0;
                 int scoreBBefore = 0;
 
                 lock (stateLock)
                 {
-                    currentMode = this.currentGameMode;
                     foreach (var snap in lobbySnapshot)
                     {
-                        if (matchProfiles.ContainsKey(snap.Name))
+                        if (isTwoRoundMode && matchCumulativeStats.ContainsKey(snap.Name))
+                        {
+                            snap.OverallScore = matchCumulativeStats[snap.Name].Score;
+                            snap.Kills = matchCumulativeStats[snap.Name].Kills;
+                            snap.Deaths = matchCumulativeStats[snap.Name].Deaths;
+                        }
+                        else if (matchProfiles.ContainsKey(snap.Name))
                         {
                             var live = matchProfiles[snap.Name];
                             snap.OverallScore = live.OverallScore;
@@ -790,7 +832,12 @@ namespace PRoConEvents
 
                 if (lobbySnapshot == null || lobbySnapshot.Count <= 4)
                 {
-                    lock (stateLock) { isMatchRunning = true; }
+                    lock (stateLock)
+                    {
+                        precalculatedTeamA = null;
+                        precalculatedTeamB = null;
+                        isMatchRunning = true;
+                    }
                     return;
                 }
 
@@ -919,25 +966,66 @@ namespace PRoConEvents
 
                 lock (stateLock)
                 {
-                    authorizedTeams.Clear();
-                    foreach (var p in finalTeamA) authorizedTeams[p.Name] = 1;
-                    foreach (var p in finalTeamB) authorizedTeams[p.Name] = 2;
+                    precalculatedTeamA = finalTeamA;
+                    precalculatedTeamB = finalTeamB;
+                    precalculatedScoreABefore = scoreABefore;
+                    precalculatedScoreBBefore = scoreBBefore;
+                    precalculatedScoreAAfter = scoreA;
+                    precalculatedScoreBAfter = scoreB;
                 }
 
-                AssignInGameSquads(finalTeamA, 1, currentMode);
-                AssignInGameSquads(finalTeamB, 2, currentMode);
+                TryLogConsole("Teams successfully pre-calculated at round end!");
+            }
+            catch (Exception ex) { TryLogConsole("CalculateBalancedTeams error: " + ex.Message); }
+        }
+
+        private void ExecutePrecalculatedTeams(string mode)
+        {
+            try
+            {
+                List<CustomPlayer> teamA = null;
+                List<CustomPlayer> teamB = null;
+                int scoreABefore = 0, scoreBBefore = 0;
+                int scoreAAfter = 0, scoreBAfter = 0;
+
+                lock (stateLock)
+                {
+                    teamA = precalculatedTeamA;
+                    teamB = precalculatedTeamB;
+                    scoreABefore = precalculatedScoreABefore;
+                    scoreBBefore = precalculatedScoreBBefore;
+                    scoreAAfter = precalculatedScoreAAfter;
+                    scoreBAfter = precalculatedScoreBAfter;
+
+                    precalculatedTeamA = null;
+                    precalculatedTeamB = null;
+                }
+
+                if (teamA == null || teamB == null)
+                {
+                    lock (stateLock) { isMatchRunning = true; }
+                    return;
+                }
+
+                lock (stateLock)
+                {
+                    authorizedTeams.Clear();
+                    foreach (var p in teamA) authorizedTeams[p.Name] = 1;
+                    foreach (var p in teamB) authorizedTeams[p.Name] = 2;
+                }
+
+                AssignInGameSquads(teamA, 1, mode);
+                AssignInGameSquads(teamB, 2, mode);
 
                 SendGlobalAnnouncement("Match over balancing teams:");
-                SendGlobalAnnouncement("Team A team playerscore: " + scoreABefore + " ---> " + scoreA);
-                SendGlobalAnnouncement("Team B team playerscore: " + scoreBBefore + " ---> " + scoreB);
+                SendGlobalAnnouncement("Team A team playerscore: " + scoreABefore + " ---> " + scoreAAfter);
+                SendGlobalAnnouncement("Team B team playerscore: " + scoreBBefore + " ---> " + scoreBAfter);
 
-                TryLogConsole("Teams successfully balanced!");
-                TryLogConsole("Team A PlayerScore Before: " + scoreABefore + " -> After: " + scoreA + " | Total Players: " + playersA);
-                TryLogConsole("Team B PlayerScore Before: " + scoreBBefore + " -> After: " + scoreB + " | Total Players: " + playersB);
+                TryLogConsole("Pre-calculated teams applied successfully!");
 
                 lock (stateLock) { isMatchRunning = true; }
             }
-            catch (Exception ex) { TryLogConsole("RunBalancer error: " + ex.Message); }
+            catch (Exception ex) { TryLogConsole("ExecutePrecalculatedTeams error: " + ex.Message); }
         }
 
         private void AssignInGameSquads(List<CustomPlayer> teamPlayers, int teamId, string mode)
