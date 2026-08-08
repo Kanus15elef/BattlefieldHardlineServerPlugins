@@ -44,6 +44,7 @@ namespace PRoConEvents
         private int minimumPlayersToVote = 4;
         private bool isWaitingForPlayers = false;
         private DateTime lastThresholdLogTime = DateTime.MinValue;
+        private DateTime lastThresholdMessageTime = DateTime.MinValue;
 
         // Loop & Round Tracker
         private string previousLevelName = string.Empty;
@@ -147,7 +148,7 @@ namespace PRoConEvents
         public CVotingSystem() { }
 
         public string GetPluginName() { return "CVotingSystem"; }
-        public string GetPluginVersion() { return "2.0.0"; }
+        public string GetPluginVersion() { return "2.0.3"; }
         public string GetPluginAuthor() { return "Yonatan (kanus15elef)"; }
         public string GetPluginWebsite() { return "localhost"; }
         public string GetPluginDescription() { return "Advanced Map & Gamemode Voting with safe MapList injection."; }
@@ -232,7 +233,7 @@ namespace PRoConEvents
 
         public void OnPluginEnable()
         {
-            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v2.0.0 Enabled!");
+            this.ExecuteCommand("procon.protected.pluginconsole.write", "^bCVotingSystem^n v2.0.3 Enabled!");
             ResetVotingState(true);
             currentPlayerCount = 0;
             isWaitingForPlayers = false;
@@ -328,9 +329,11 @@ namespace PRoConEvents
 
                 if (!thresholdMet)
                 {
-                    if (currentPhase != VotingPhase.Idle || roundStartDelayTimer != null || isWaitingForPlayers)
+                    bool shouldSendThresholdMessage = !isWaitingForPlayers || (DateTime.Now - lastThresholdMessageTime).TotalSeconds >= 120;
+
+                    if (shouldSendThresholdMessage)
                     {
-                        LogLive($"[CVotingSystem] [Live]: Player count ({currentPlayerCount}) dropped below minimum requirement ({minimumPlayersToVote}). Executing automatic !voterefresh.");
+                        LogLive($"[CVotingSystem] [Live]: Player count ({currentPlayerCount}) below minimum requirement ({minimumPlayersToVote}). Executing automatic !voterefresh.");
                         
                         try
                         {
@@ -340,7 +343,8 @@ namespace PRoConEvents
                         catch { }
 
                         ResetVotingState(true);
-                        SendGlobalChat("Postponing and clearing all voting phase waiting for player threshold to reach  to start the voting again !");
+                        SendGlobalChat("Postponing and clearing all voting phase waiting for player threshold to reach to start the voting again !");
+                        lastThresholdMessageTime = DateTime.Now;
                     }
 
                     if (!isWaitingForPlayers)
